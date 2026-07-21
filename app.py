@@ -54,7 +54,7 @@ IMPORTANT ACCURACY RULES
 CORE STRATEGY — TWO DEMAND PIPELINES
 1. Always-On Emergency Capture: Google Local Services Ads (LSA / "Google Guaranteed") + high-intent Search/PPC,
    backed by Missed-Call Text Back so a call they cannot answer never becomes a competitor's job.
-2. SmartClimate Weather-Triggered Demand: CTV/OTT and programmatic display that automatically switch ON during
+2. SmartForecast Weather-Triggered Demand: CTV/OTT and programmatic display that automatically switch ON during
    extreme heat and cold and PAUSE in mild weather, preserving budget for high-value days. Layer New-Mover and
    home-improver audience data to build a replacement-system pipeline.
 
@@ -62,7 +62,7 @@ LSA AWARENESS
 - The input includes lsa_status. If it is 'no', 'paused', or 'unsure', the plan MUST prioritize claiming and
   optimizing the Google LSA (Google Guaranteed) profile as the #1 move. Do not assume they already have it.
 - If lsa_status is 'yes_active', treat this as a conquest scenario: they already own the LSA spot, so lead with
-  SmartClimate CTV, New-Mover, and programmatic display to expand beyond LSA.
+  SmartForecast CTV, New-Mover, and programmatic display to expand beyond LSA.
 
 ALLOWED CHANNELS / DATA ONLY
 - Google LSA, high-intent Search/PPC, CTV/OTT, programmatic / data-driven targeted display, New-Mover &
@@ -285,10 +285,10 @@ def generate_report(payload: dict) -> Any:
         "    * $749/month — Comfort Starter (brand-new or single-truck: LSA + high-intent Search foundation)\n"
         "    * $1,499/month — Local Comfort Foundation (dominate one city: LSA + Search mgmt, Local Business Boost, "
         "Missed-Call Text Back, automated reviews)\n"
-        "    * $3,499/month — Omnichannel Market Leader (adds SmartClimate CTV + New-Mover & home-improver display)\n"
+        "    * $3,499/month — Omnichannel Market Leader (adds SmartForecast CTV + New-Mover & home-improver display)\n"
         "    * $6,500/month — Regional Domination (multi-market full weather-triggered omnichannel at scale)\n"
         "- media_channels: ALLOWED channels/data only. ALWAYS include 'Google LSA (Google Guaranteed)' and 'In-Market "
-        "HVAC Buyer Audience Data' as chips. Then choose from: high-intent Search/PPC, SmartClimate CTV/OTT, New-Mover & "
+        "HVAC Buyer Audience Data' as chips. Then choose from: high-intent Search/PPC, SmartForecast CTV/OTT, New-Mover & "
         "home-improver display, programmatic targeted display, streaming audio, YouTube/online video, website retargeting, "
         "Local Business Boost, Missed-Call Text Back. Return 5-8 chips total. NEVER include paid social, email, or SMS.\n"
         "- streaming_audio_note: a short recommendation to geotarget streaming audio around home neighborhoods and "
@@ -425,7 +425,7 @@ def build_report_pdf(report: dict, company: str, base_url: str) -> str:
 
         trigs = report.get("weather_triggers", []) or []
         if trigs:
-            story.append(Paragraph("SmartClimate Weather Triggers", st["h2"]))
+            story.append(Paragraph("SmartForecast Weather Triggers", st["h2"]))
             story.append(Paragraph(" &nbsp;•&nbsp; ".join(trigs), st["body"]))
 
         plan = report.get("monthly_plan", []) or []
@@ -523,6 +523,11 @@ def send_webhook(payload: dict, report: Any, status: str, pdf_url: str = "") -> 
 
 
 @app.get("/")
+def landing():
+    return render_template("landing.html")
+
+
+@app.get("/plan")
 def index():
     return render_template("index.html")
 

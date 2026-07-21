@@ -5,7 +5,7 @@ weather-triggered demand and targeting plan with:
 
 - A recommended investment tier matched to the market and goals
 - An always-on emergency-capture pipeline (Google LSA + high-intent Search + Missed-Call Text Back)
-- A SmartClimate™ weather-triggered CTV & display plan (activates on extreme heat/cold, pauses in mild weather)
+- A SmartForecast™ weather-triggered CTV & display plan (activates on extreme heat/cold, pauses in mild weather)
 - New-mover and home-improver audience targeting
 - Estimated population, homeowner households, and replacement-ready (aging-system) homes
 - A 12-month campaign plan with seasonal budget pacing
@@ -35,7 +35,8 @@ audiences/polygons in the advertising platform.
 smart1hvac/
 ├── app.py               # Flask backend + OpenAI report generation + webhook + PDF
 ├── templates/
-│   └── index.html       # Self-contained multi-step form (CSS + JS inlined)
+│   ├── landing.html     # Marketing landing page (served at /) — funnels into the form
+│   └── index.html       # Self-contained multi-step intake form (CSS + JS inlined)
 ├── static/
 │   └── reports/         # Generated PDFs are written here
 ├── requirements.txt
@@ -45,14 +46,18 @@ smart1hvac/
 └── .gitignore
 ```
 
-`index.html` lives in `templates/` because the backend serves it with Flask's
-`render_template("index.html")`. The page is intentionally self-contained: all
-CSS and JavaScript are inlined, so there are no separate `styles.css` or `app.js`
-files to keep in sync. This keeps the form reliable when embedded in Smart 1 Suite.
+Both pages live in `templates/` and are served with Flask's `render_template`.
+`landing.html` is the marketing front door at `/`; its primary calls-to-action
+link to `/plan`, which serves the multi-step intake form (`index.html`). Both
+pages are intentionally self-contained — all CSS and JavaScript are inlined, so
+there are no separate `styles.css` or `app.js` files to keep in sync. This keeps
+them reliable when embedded in Smart 1 Suite. The landing page's "Talk to a
+Strategist" links point to `https://smart1marketing.com/free-consultation`.
 
 ## Endpoints
 
-- `GET /` — the form
+- `GET /` — the marketing landing page
+- `GET /plan` — the multi-step intake form
 - `GET /health` — health check (used by Render)
 - `POST /api/analyze` — generates the AI plan for a qualified lead
 - `POST /api/lead` — lightweight capture for the LSA conquest (soft-disqualify) branch
@@ -72,7 +77,7 @@ files to keep in sync. This keeps the form reliable when embedded in Smart 1 Sui
 5. Add `SMART1_WEBHOOK_URL` for the Smart 1 Suite inbound webhook.
 6. Add `PUBLIC_BASE_URL` = your live Render URL (e.g. `https://smart1hvac.onrender.com`) so the report PDF links are absolute.
 7. Keep `OPENAI_MODEL` at the default or change it to a model available in your OpenAI account.
-8. Deploy and test `/health`, then test the full form.
+8. Deploy and test `/health`, open `/` for the landing page, then test the full form at `/plan`.
 
 ## Smart 1 Suite fields
 
@@ -108,7 +113,7 @@ conquest (already-on-LSA) leads into a separate pipeline.
 
 ```html
 <iframe
-  src="https://YOUR-RENDER-URL.onrender.com/"
+  src="https://YOUR-RENDER-URL.onrender.com/plan"
   style="width:100%;min-height:1200px;border:0;border-radius:12px;"
   loading="lazy"
   title="HVAC Comfort & Command Market Plan">
@@ -133,7 +138,7 @@ GHL Media Library inside `build_report_pdf()`.
 | --- | --- | --- |
 | Comfort Starter | $749/mo | Brand-new / single-truck: LSA + Search foundation |
 | Local Comfort Foundation | $1,499/mo | Dominate one city (documented tier) |
-| Omnichannel Market Leader | $3,499/mo | Add SmartClimate CTV + New-Mover display (documented tier) |
+| Omnichannel Market Leader | $3,499/mo | Add SmartForecast CTV + New-Mover display (documented tier) |
 | Regional Domination | $6,500/mo | Multi-market omnichannel at scale |
 
 > Comfort Starter ($749) and Regional Domination ($6,500) are illustrative
@@ -151,4 +156,4 @@ cp .env.example .env   # then add your OPENAI_API_KEY
 python app.py
 ```
 
-Open `http://localhost:5000`.
+Open `http://localhost:5000` for the landing page, or `http://localhost:5000/plan` for the intake form.
