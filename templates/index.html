@@ -20,6 +20,7 @@
 @media(max-width:780px){.shell{padding-top:24px}.hero h1{font-size:2.35rem}.step-nav small{display:none}.step{padding:26px 22px 10px}.form-top{padding:18px 22px 14px}.step-nav{padding-left:22px;padding-right:22px}.grid.two,.goal-list,.tactic-grid{grid-template-columns:1fr}.choice-grid.four{grid-template-columns:1fr 1fr}.radius-grid{grid-template-columns:repeat(3,1fr)}.actions{padding:16px 22px 28px}.error{padding-left:22px;padding-right:22px}.report-head{display:block}.toolbar{margin-top:16px}.results{padding:22px}.gate{padding:34px 24px}.pkg-grid{grid-template-columns:1fr 1fr}.stat-cards{grid-template-columns:1fr}.review-grid{grid-template-columns:1fr}}
 @media(max-width:480px){.hero p{font-size:.9rem}.benefit-row{gap:6px}.benefit-row span{font-size:.64rem}.form-top strong,.save-note{display:none}.step-heading h2{font-size:1.35rem}.radius-grid{grid-template-columns:1fr 1fr}.choice-grid.four{grid-template-columns:1fr 1fr}.actions button{padding:12px 15px}.pkg-grid{grid-template-columns:1fr}}
 @media print{body{background:#fff}.hero,.card,.privacy-note,.toolbar{display:none!important}.shell{width:100%;padding:0}.results{box-shadow:none;border:0;padding:0}.table-wrap{overflow:visible}table{min-width:0;font-size:8pt}}
+  .embedded .hero{display:none!important}.embedded .shell{padding:14px 0 34px}.embedded .privacy-note{margin-top:12px}
   </style>
 </head>
 <body>
@@ -448,6 +449,30 @@ document.getElementById('conquestForm').addEventListener('submit',async e=>{
 
 updateGoalTip();
 showStep();
+  
+// ---- Embedded-in-landing support (auto-hide hero + auto-resize) ----
+(function(){
+  if(window.self===window.top) return;            // only when iframed
+  document.documentElement.classList.add('embedded');
+  // Tell the host page the form is on screen so it can reveal instantly (exact reveal).
+  function ready(){ try{parent.postMessage('app-ready','*');}catch(e){} }
+  ready();setTimeout(ready,120);setTimeout(ready,600);
+  window.addEventListener('load',ready);
+  function postH(){
+    var h=Math.max(document.body.scrollHeight,document.documentElement.scrollHeight);
+    try{parent.postMessage({t:'s1planH',h:h},'*');}catch(e){}
+  }
+  window.addEventListener('load',postH);
+  window.addEventListener('resize',postH);
+  try{new ResizeObserver(postH).observe(document.body);}catch(e){}
+  try{new MutationObserver(postH).observe(document.body,{subtree:true,childList:true,attributes:true});}catch(e){}
+  function watch(el){ if(!el)return; new MutationObserver(function(){ if(!el.classList.contains('hidden')){ try{parent.postMessage({t:'s1planScroll'},'*');}catch(e){} } }).observe(el,{attributes:true,attributeFilter:['class']}); }
+  watch(document.getElementById('loading'));
+  watch(document.getElementById('results'));
+  watch(document.getElementById('conquestGate'));
+  postH();setTimeout(postH,300);setTimeout(postH,1200);
+})();
+
   </script>
 </body>
 </html>

@@ -147,6 +147,24 @@ section{padding:72px 0}
 .footer .tm{margin-top:14px;color:#5f7488}
 
 /* ---------- RESPONSIVE ---------- */
+.planembed{background:var(--bg)}
+.plan-frame-wrap{position:relative;border-radius:20px;overflow:hidden;box-shadow:var(--shadow);min-height:640px;background:#fff}
+.planembed #planFrame{width:100%;border:0;min-height:640px;background:#fff;display:block}
+.plan-loader{position:absolute;inset:0;z-index:2;display:grid;place-items:center;background:radial-gradient(circle at 28% 18%,#123863,#0a2240 72%);transition:opacity .5s ease}
+.plan-loader.hide{opacity:0;pointer-events:none}
+.pl-inner{text-align:center;padding:30px;max-width:380px}
+.pl-logo{height:30px;width:auto;margin:0 auto 26px;opacity:.96}
+.pl-radar{width:132px;height:132px;margin:0 auto 22px;display:block}
+.pl-radar .sweep{transform-box:fill-box;transform-origin:60px 60px;animation:plsweep 2.4s linear infinite}
+.pl-radar .pin{transform-box:fill-box;transform-origin:center;animation:plpulse 1.6s ease-in-out infinite}
+@keyframes plsweep{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+@keyframes plpulse{0%,100%{opacity:.5;transform:scale(.82)}50%{opacity:1;transform:scale(1.15)}}
+.pl-status{color:#dce8f3;font-size:.87rem;font-weight:700;min-height:1.2em;transition:opacity .25s}
+.pl-bar{margin:16px auto 0;width:220px;max-width:78%;height:6px;border-radius:999px;background:rgba(255,255,255,.14);overflow:hidden}
+.pl-bar span{display:block;height:100%;width:6%;border-radius:999px;background:linear-gradient(90deg,var(--cool),var(--heat));transition:width .6s ease}
+.pl-fallback{display:inline-block;margin-top:22px;color:#8ea3ba;font-size:.72rem;text-decoration:none;border-bottom:1px solid rgba(255,255,255,.2);padding-bottom:2px}
+.pl-fallback:hover{color:#fff}
+@media(prefers-reduced-motion:reduce){.pl-radar .sweep,.pl-radar .pin{animation:none}}
 @media(max-width:900px){
   .pipe-grid,.price-grid{grid-template-columns:1fr}
   .tactic-grid,.suite-grid{grid-template-columns:1fr 1fr}
@@ -175,6 +193,7 @@ section{padding:72px 0}
       <a href="#strategy">Strategy</a>
       <a href="#tactics">Channels</a>
       <a href="#suite">Automation</a>
+      <a href="#plan">Get My Plan</a>
     </nav>
     <div style="display:flex;align-items:center;gap:10px">
       <a class="btn btn-primary nav-cta" href="https://smart1marketing.com/free-consultation">Free Consultation</a>
@@ -190,7 +209,7 @@ section{padding:72px 0}
     <h1>Own every <span class="accent">&ldquo;AC repair near me&rdquo;</span> moment in your market.</h1>
     <p class="lede">A weather-triggered, always-on marketing system built specifically for HVAC contractors. We capture emergency search demand, fire SmartForecast™ ads on the hottest and coldest days, target new movers before your competitors do, and text back every missed call automatically.</p>
     <div class="hero-cta">
-      <a class="btn btn-primary btn-lg" href="/plan">Build My Instant Plan</a>
+      <a class="btn btn-primary btn-lg" href="#plan">Build My Instant Plan</a>
       <a class="btn btn-ghost btn-lg" href="#strategy">See How It Works</a>
     </div>
     <div class="pill-row">
@@ -319,13 +338,53 @@ section{padding:72px 0}
   </div>
 </section>
 
+<!-- EMBEDDED PLAN BUILDER -->
+<section class="planembed" id="plan">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="eyebrow">Build Your Plan</div>
+      <h2>Get your instant Comfort &amp; Command plan.</h2>
+      <p>Answer a few quick questions about your market and goals &mdash; your recommended plan appears right here, in about three minutes. No obligation.</p>
+    </div>
+    <div class="plan-frame-wrap" id="planWrap">
+      <iframe id="planFrame" data-src="/plan" title="Build your HVAC marketing plan" loading="lazy" scrolling="no"></iframe>
+      <div class="plan-loader" id="planLoader" role="status" aria-live="polite">
+        <div class="pl-inner">
+          <img class="pl-logo" src="https://content.app-sources.com/s/30680510049142132/uploads/Our_Products_/logo-final-cmyk-hz1line-white-9562849.png?format=webp" alt="Smart 1 Marketing">
+          <svg class="pl-radar" viewBox="0 0 120 120" role="img" aria-label="Mapping your market">
+            <defs>
+              <linearGradient id="plsw" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0" stop-color="#0a9ed6" stop-opacity="0"/>
+                <stop offset="1" stop-color="#f2683c" stop-opacity=".85"/>
+              </linearGradient>
+            </defs>
+            <circle cx="60" cy="60" r="52" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="1.5"/>
+            <circle cx="60" cy="60" r="34" fill="none" stroke="rgba(255,255,255,.10)" stroke-width="1.5"/>
+            <circle cx="60" cy="60" r="16" fill="none" stroke="rgba(255,255,255,.10)" stroke-width="1.5"/>
+            <line x1="60" y1="8" x2="60" y2="112" stroke="rgba(255,255,255,.08)" stroke-width="1"/>
+            <line x1="8" y1="60" x2="112" y2="60" stroke="rgba(255,255,255,.08)" stroke-width="1"/>
+            <g class="sweep"><path d="M60 60 L60 8 A52 52 0 0 1 108 60 Z" fill="url(#plsw)"/></g>
+            <g class="pin" transform="translate(80,42)">
+              <path d="M0 -9 C5 -9 9 -5 9 0 C9 6 0 14 0 14 C0 14 -9 6 -9 0 C-9 -5 -5 -9 0 -9 Z" fill="#f2683c"/>
+              <circle cx="0" cy="0" r="3.2" fill="#fff"/>
+            </g>
+          </svg>
+          <div class="pl-status" id="plStatus">Waking up the market engine&hellip;</div>
+          <div class="pl-bar"><span id="plBar"></span></div>
+          <a class="pl-fallback" id="plFallback" href="/plan" target="_blank" rel="noopener">Trouble loading? Open in a new tab &#8599;</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- CTA BAND -->
 <section class="cta">
   <div class="wrap">
     <h2>Let&rsquo;s build your Comfort &amp; Command plan.</h2>
     <p>Answer a few questions about your service area and goals. We&rsquo;ll map the weather triggers, high-intent keywords, and audiences for your market &mdash; and recommend the right tier instantly. No obligation.</p>
     <div class="hero-cta" style="justify-content:center">
-      <a class="btn btn-primary btn-lg" href="/plan">Build My Instant Plan</a>
+      <a class="btn btn-primary btn-lg" href="#plan">Build My Instant Plan</a>
       <a class="btn btn-ghost btn-lg" href="https://smart1marketing.com/free-consultation">Talk to a Strategist</a>
     </div>
     <small>Build a plan in about 3 minutes, or book a free consultation. A strategist finalizes budgets, geography, and territorial exclusions before any campaign activates.</small>
@@ -353,6 +412,66 @@ section{padding:72px 0}
   var t=document.getElementById('navToggle'),l=document.getElementById('navLinks');
   if(t){t.addEventListener('click',function(){l.classList.toggle('open');});}
   document.querySelectorAll('.nav-links a').forEach(function(a){a.addEventListener('click',function(){l.classList.remove('open');});});
+</script>
+<script>
+  (function(){
+    var frame=document.getElementById('planFrame'),
+        loader=document.getElementById('planLoader'),
+        wrap=document.getElementById('planWrap'),
+        statusEl=document.getElementById('plStatus'),
+        barEl=document.getElementById('plBar'),
+        section=document.getElementById('plan');
+    if(!frame) return;
+    var warmStarted=false, revealed=false, startAt=0,
+        MIN_SHOW=1200, QUIET_MS=4000, HARD_CAP=45000,
+        statusTimer=null, quietTimer=null, capTimer=null,
+        steps=['Waking up the market engine\u2026','Mapping your trade area\u2026','Reading local weather patterns\u2026','Setting your SmartForecast\u2122 triggers\u2026','Ranking your best ZIP targets\u2026','Almost ready\u2026'],
+        si=0, pct=6;
+
+    function cycle(){
+      statusEl.textContent=steps[si];
+      barEl.style.width=pct+'%';
+      si=Math.min(si+1,steps.length-1);
+      pct=Math.min(pct+(pct<70?15:6),94);
+      statusTimer=setTimeout(cycle, si>=steps.length-1?3200:2200);
+    }
+    function warm(){
+      if(warmStarted) return; warmStarted=true; startAt=Date.now();
+      frame.src=frame.getAttribute('data-src');   // begins the Render wake-up
+      cycle();
+      capTimer=setTimeout(reveal,HARD_CAP);       // safety net
+      frame.addEventListener('load',function(){   // quiet-timeout fallback
+        clearTimeout(quietTimer); quietTimer=setTimeout(reveal,QUIET_MS);
+      });
+    }
+    function reveal(){
+      if(revealed) return;
+      var wait=Math.max(0,MIN_SHOW-(Date.now()-startAt));
+      setTimeout(function(){
+        if(revealed) return; revealed=true;
+        clearTimeout(statusTimer); clearTimeout(quietTimer); clearTimeout(capTimer);
+        barEl.style.width='100%'; statusEl.textContent='Ready';
+        setTimeout(function(){ loader.classList.add('hide'); },260);
+      }, wait);
+    }
+
+    // Background pre-warm: start loading when the section nears the viewport, or on CTA hover.
+    if('IntersectionObserver' in window){
+      var io=new IntersectionObserver(function(en){ if(en[0].isIntersecting){ warm(); io.disconnect(); } },{rootMargin:'700px'});
+      io.observe(section);
+    } else { warm(); }
+    document.querySelectorAll('a[href="#plan"]').forEach(function(a){
+      a.addEventListener('mouseenter',warm); a.addEventListener('click',warm);
+    });
+
+    // Messages from the embedded tool.
+    window.addEventListener('message',function(e){
+      var d=e.data||{};
+      if(d==='app-ready'){ reveal(); return; }                       // exact reveal ping
+      if(d.t==='s1planH'&&d.h){ frame.style.height=(d.h+8)+'px'; wrap.style.minHeight=(d.h+8)+'px'; }
+      if(d.t==='s1planScroll'&&section){ section.scrollIntoView({behavior:'smooth',block:'start'}); }
+    });
+  })();
 </script>
 </body>
 </html>
