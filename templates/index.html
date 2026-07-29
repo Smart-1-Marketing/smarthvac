@@ -358,7 +358,6 @@ document.getElementById('gateBack').onclick=()=>{
 
 nextBtn.onclick=()=>{
   if(!validStep())return;
-  if(current===0 && lsaValue()==='yes_active'){goToConquest();return;}
   current++;showStep();
 };
 backBtn.onclick=()=>{if(current>0){current--;showStep();}};

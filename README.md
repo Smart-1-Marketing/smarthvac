@@ -74,10 +74,23 @@ Strategist" links point to `https://smart1marketing.com/free-consultation`.
 2. Connect the `smart1hvac` GitHub repository.
 3. Render will read `render.yaml`.
 4. Add the secret environment variable `OPENAI_API_KEY`.
-5. Add `SMART1_WEBHOOK_URL` for the Smart 1 Suite inbound webhook.
-6. Add `PUBLIC_BASE_URL` = your live Render URL (e.g. `https://smart1hvac.onrender.com`) so the report PDF links are absolute.
-7. Keep `OPENAI_MODEL` at the default or change it to a model available in your OpenAI account.
-8. Deploy and test `/health`, open `/` for the landing page, then test the full form at `/plan`.
+5. Add `GHL_WEBHOOK_URL` — the GoHighLevel (Smart 1 Suite) inbound-webhook trigger URL. Lead data + the report PDF URL are POSTed here.
+6. Add `CLOUDINARY_URL` — permanent storage for the generated PDF reports (`cloudinary://<api_key>:<api_secret>@<cloud_name>`). Reports are stored under the `hvac-report` folder.
+7. Add `PUBLIC_BASE_URL` = your live Render URL (e.g. `https://smarthvac.onrender.com`). Only used for the local-PDF fallback link when Cloudinary is not configured.
+8. Keep `OPENAI_MODEL` at the default or change it to a model available in your OpenAI account.
+9. Deploy and test `/health`, open `/` for the landing page, then test the full form at `/plan`.
+
+### Environment variables (Render)
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | yes | Generates the AI plan. If unset/invalid, a labeled baseline plan is served. |
+| `GHL_WEBHOOK_URL` | yes | GoHighLevel inbound webhook — receives the lead + `report_pdf_url`. (`SMART1_WEBHOOK_URL` still read as a fallback.) |
+| `CLOUDINARY_URL` | yes | Permanent PDF storage. Falls back to local `static/reports/` if unset. |
+| `OPENAI_MODEL` | no | Defaults to `gpt-4.1-mini`. |
+| `PUBLIC_BASE_URL` | no | Absolute base for the local-PDF fallback URL only. |
+| `ENABLE_PDF` | no | `1` (default) builds the PDF; `0` disables it. |
+| `PYTHON_VERSION` | no | `3.12.4`. |
 
 ## Smart 1 Suite fields
 
@@ -126,11 +139,13 @@ avoids cross-origin restrictions inside Smart 1 Suite.
 ## PDF report
 
 Every completed report is rendered to a branded PDF (via `reportlab`, pure
-Python — no system libraries needed) and written to `static/reports/`. The
-public URL is sent to Smart 1 Suite in the webhook as `report_pdf_url`. Set
-`ENABLE_PDF=0` to turn this off. On Render's ephemeral disk the files persist for
-the life of the instance; for permanent archival, upload the bytes to S3 or the
-GHL Media Library inside `build_report_pdf()`.
+Python — no system libraries needed). When `CLOUDINARY_URL` is set, the PDF is
+uploaded to Cloudinary as a `raw` asset under the **`hvac-report`**
+folder (permanent storage), and the returned `secure_url` is sent to the GHL
+webhook as `report_pdf_url`. If Cloudinary is not configured or the upload
+fails, the app falls back to writing the PDF under `static/reports/` and sends a
+`PUBLIC_BASE_URL`-based link instead (ephemeral on Render's disk). Set
+`ENABLE_PDF=0` to turn PDF generation off entirely.
 
 ## Investment tiers
 
