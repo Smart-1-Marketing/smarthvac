@@ -31,28 +31,14 @@ load_dotenv()
 app = Flask(__name__)
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-# Standardized on GHL_WEBHOOK_URL. SMART1_WEBHOOK_URL is still read as a fallback
-# so older deployments keep working until they switch the env var over.
-WEBHOOK_URL = (os.getenv("GHL_WEBHOOK_URL") or os.getenv("SMART1_WEBHOOK_URL") or "").strip()
+WEBHOOK_URL = os.getenv("SMART1_WEBHOOK_URL", "").strip()
 # Absolute base used to build the public report_pdf_url (e.g. https://smart1hvac.onrender.com).
-# If empty, the app derives it from the incoming request. Ignored when Cloudinary is configured.
+# If empty, the app derives it from the incoming request.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 ENABLE_PDF = os.getenv("ENABLE_PDF", "1").strip() not in ("0", "false", "False", "")
 REPORT_DIR = os.path.join(app.static_folder, "reports")
-
-# Cloudinary — permanent storage for the generated PDF reports. The SDK reads the
-# CLOUDINARY_URL env var automatically (cloudinary://<key>:<secret>@<cloud_name>).
-# All report PDFs are stored under the "hvac-report" folder/name.
-REPORT_ASSET_NAME = "hvac-report"
-CLOUDINARY_READY = False
-if os.getenv("CLOUDINARY_URL", "").strip():
-    try:
-        import cloudinary
-        import cloudinary.uploader
-        cloudinary.config(secure=True)  # auto-configures from CLOUDINARY_URL
-        CLOUDINARY_READY = True
-    except Exception:
-        app.logger.exception("Cloudinary configuration failed; using local PDF storage")
+# Your GHL / calendar booking link, shown as the primary CTA on the report.
+BOOKING_URL = os.getenv("BOOKING_URL", "").strip()
 
 SYSTEM_PROMPT = """
 You are the Smart 1 Marketing HVAC "Comfort & Command" Market Intelligence Architect.
@@ -70,7 +56,7 @@ IMPORTANT ACCURACY RULES
 CORE STRATEGY — TWO DEMAND PIPELINES
 1. Always-On Emergency Capture: Google Local Services Ads (LSA / "Google Guaranteed") + high-intent Search/PPC,
    backed by Missed-Call Text Back so a call they cannot answer never becomes a competitor's job.
-2. SmartForecast Weather-Triggered Demand: CTV/OTT and programmatic display that automatically switch ON during
+2. SmartClimate Weather-Triggered Demand: CTV/OTT and programmatic display that automatically switch ON during
    extreme heat and cold and PAUSE in mild weather, preserving budget for high-value days. Layer New-Mover and
    home-improver audience data to build a replacement-system pipeline.
 
@@ -78,7 +64,7 @@ LSA AWARENESS
 - The input includes lsa_status. If it is 'no', 'paused', or 'unsure', the plan MUST prioritize claiming and
   optimizing the Google LSA (Google Guaranteed) profile as the #1 move. Do not assume they already have it.
 - If lsa_status is 'yes_active', treat this as a conquest scenario: they already own the LSA spot, so lead with
-  SmartForecast CTV, New-Mover, and programmatic display to expand beyond LSA.
+  SmartClimate CTV, New-Mover, and programmatic display to expand beyond LSA.
 
 ALLOWED CHANNELS / DATA ONLY
 - Google LSA, high-intent Search/PPC, CTV/OTT, programmatic / data-driven targeted display, New-Mover &
@@ -301,10 +287,10 @@ def generate_report(payload: dict) -> Any:
         "    * $749/month — Comfort Starter (brand-new or single-truck: LSA + high-intent Search foundation)\n"
         "    * $1,499/month — Local Comfort Foundation (dominate one city: LSA + Search mgmt, Local Business Boost, "
         "Missed-Call Text Back, automated reviews)\n"
-        "    * $3,499/month — Omnichannel Market Leader (adds SmartForecast CTV + New-Mover & home-improver display)\n"
+        "    * $3,499/month — Omnichannel Market Leader (adds SmartClimate CTV + New-Mover & home-improver display)\n"
         "    * $6,500/month — Regional Domination (multi-market full weather-triggered omnichannel at scale)\n"
         "- media_channels: ALLOWED channels/data only. ALWAYS include 'Google LSA (Google Guaranteed)' and 'In-Market "
-        "HVAC Buyer Audience Data' as chips. Then choose from: high-intent Search/PPC, SmartForecast CTV/OTT, New-Mover & "
+        "HVAC Buyer Audience Data' as chips. Then choose from: high-intent Search/PPC, SmartClimate CTV/OTT, New-Mover & "
         "home-improver display, programmatic targeted display, streaming audio, YouTube/online video, website retargeting, "
         "Local Business Boost, Missed-Call Text Back. Return 5-8 chips total. NEVER include paid social, email, or SMS.\n"
         "- streaming_audio_note: a short recommendation to geotarget streaming audio around home neighborhoods and "
@@ -342,138 +328,6 @@ def generate_report(payload: dict) -> Any:
             text = text[4:]
         text = text.strip()
     return json.loads(text)
-
-
-# ---------------------------------------------------------------------------
-# Deterministic fallback plan — used only if the AI call fails for any reason
-# (missing/invalid key, model access, rate limit, timeout). Guarantees the
-# visitor always gets a usable proposal instead of a dead-end error.
-# ---------------------------------------------------------------------------
-
-def _recommend_tier(payload: dict):
-    radius = int(re.sub(r"[^\d]", "", payload.get("service_radius", "")) or "15")
-    loc = payload.get("locations", "1")
-    obj = (payload.get("objectives", "") or "").lower()
-    focus = payload.get("revenue_focus", "")
-    if "just launched" in obj or "getting started" in obj or "scratch" in obj:
-        return ("Comfort Starter", "$749/month", 749)
-    if loc == "4+" or radius >= 60:
-        return ("Regional Domination", "$6,500/month", 6500)
-    if (radius >= 40 or loc == "2-3" or "replacement" in obj or "awareness" in obj
-            or "commercial" in obj or "movers" in obj or focus == "System replacement"):
-        return ("Omnichannel Market Leader", "$3,499/month", 3499)
-    return ("Local Comfort Foundation", "$1,499/month", 1499)
-
-
-def fallback_report(payload: dict) -> dict:
-    company = payload.get("company_name", "your company")
-    zip_code = payload.get("company_zip", "your area")
-    radius = int(re.sub(r"[^\d]", "", payload.get("service_radius", "")) or "15")
-    name, price, monthly = _recommend_tier(payload)
-
-    # Rough, clearly-labeled baseline estimates that scale with service radius.
-    hh_base = max(8000, radius * 1400)
-    homeowner = int(hh_base * 0.62)
-    replacement = int(homeowner * 0.28)
-    pop_base = int(hh_base * 2.5)
-
-    def rng(v):
-        return int(v * 0.8), v, int(v * 1.2)
-
-    pop = rng(pop_base); hh = rng(hh_base); own = rng(homeowner); rep = rng(replacement)
-
-    triggers = ["90°+ heat wave", "Heat advisory", "Humidity spike", "First hard freeze",
-                "Cold snap", "First frost", "Holiday-weekend forecast", "Seasonal changeover"]
-
-    peak = {"Jun", "Jul", "Aug", "Sep", "Dec", "Jan", "Feb"}
-    shoulder = {"Apr", "May", "Oct", "Nov"}
-    months = ["January", "February", "March", "April", "May", "June",
-              "July", "August", "September", "October", "November", "December"]
-    monthly_plan = []
-    for m in months:
-        key = m[:3] if m[:3] != "Jun" else "Jun"
-        abbr = m[:3]
-        if abbr in peak:
-            pacing = f"Peak — 100% (${monthly:,})"
-            focus = "Peak-season demand capture"
-        elif abbr in shoulder:
-            pacing = f"Shoulder — 50% (${int(monthly*0.5):,})"
-            focus = "Shoulder-season tune-ups & early replacement"
-        else:
-            pacing = f"Mild — 35% (${int(monthly*0.35):,})"
-            focus = "Maintenance, memberships & brand-building"
-        monthly_plan.append({
-            "month": m, "focus": focus,
-            "message": "Match spend to comfort demand — lean in when weather drives calls, ease off when it's mild.",
-            "triggers": triggers[:2] if abbr in peak else triggers[3:5],
-            "pacing": pacing,
-        })
-
-    geofence = [
-        {"priority": 1, "name": "Newer owner-occupied neighborhoods", "city_state": zip_code,
-         "category": "Home-improver audience", "area_or_market": f"Within {radius} mi",
-         "recommended_method": "audience_targeting", "recommended_radius_miles": radius,
-         "audience_reason": "Higher propensity for system upgrades and replacements.",
-         "best_message": "Beat the next heat wave — upgrade before it fails.", "confidence": "medium"},
-        {"priority": 1, "name": "Recent movers (last 6 months)", "city_state": zip_code,
-         "category": "New-mover data", "area_or_market": f"Within {radius} mi",
-         "recommended_method": "audience_targeting", "recommended_radius_miles": radius,
-         "audience_reason": "New movers are ~5x more likely to buy home services.", "best_message":
-         "New home? Get your comfort system checked.", "confidence": "medium"},
-        {"priority": 2, "name": "Home-improvement retailers", "city_state": zip_code,
-         "category": "Retail geofence", "area_or_market": f"Within {radius} mi",
-         "recommended_method": "geofence", "recommended_radius_miles": 2,
-         "audience_reason": "Homeowners in active-improvement mindset.",
-         "best_message": "Skip the DIY — book a pro tune-up.", "confidence": "medium"},
-        {"priority": 2, "name": "Older housing-stock ZIP clusters", "city_state": zip_code,
-         "category": "Replacement-ready homes", "area_or_market": f"Within {radius} mi",
-         "recommended_method": "zip_targeting", "recommended_radius_miles": radius,
-         "audience_reason": "Aging systems (~10+ yrs) drive replacement demand.",
-         "best_message": "Is your system on borrowed time?", "confidence": "medium"},
-        {"priority": 3, "name": "Competitor HVAC service areas", "city_state": zip_code,
-         "category": "Conquest", "area_or_market": f"Within {radius} mi",
-         "recommended_method": "conquest", "recommended_radius_miles": radius,
-         "audience_reason": "Capture demand shopping your competitors.",
-         "best_message": "Faster response, no-surprise pricing.", "confidence": "low"},
-    ]
-
-    return {
-        "market_summary": f"Baseline Comfort & Command plan for {company} in {zip_code} "
-                          f"(within {radius} miles). Figures below are Smart 1 planning "
-                          "baselines and will be refined with a strategist.",
-        "market_type": "Dual-Season Heating & Cooling Market",
-        "market_type_description": "Demand swings with both summer heat and winter cold, "
-                                   "so budget is paced to weather rather than spread flat.",
-        "market_opportunity": f"Capture emergency search demand and weather-triggered "
-                              f"replacement sales across {company}'s {radius}-mile service area.",
-        "market_profile": {
-            "estimated_population_low": pop[0], "estimated_population_base": pop[1], "estimated_population_high": pop[2],
-            "estimated_households_low": hh[0], "estimated_households_base": hh[1], "estimated_households_high": hh[2],
-            "estimated_homeowner_households_low": own[0], "estimated_homeowner_households_base": own[1], "estimated_homeowner_households_high": own[2],
-            "estimated_replacement_opportunity_low": rep[0], "estimated_replacement_opportunity_base": rep[1], "estimated_replacement_opportunity_high": rep[2],
-            "confidence": "low",
-            "assumptions": ["Baseline estimate scaled from service radius; not census-verified.",
-                            "A strategist will confirm real market figures before activation."],
-        },
-        "recommended_package": {
-            "package_name": name, "monthly_investment": price,
-            "description": "Best-fit starting tier based on your service area, crews, and goals. "
-                           "Media budgets stay transparent and separate from management fees.",
-        },
-        "media_channels": ["Google LSA (Google Guaranteed)", "In-Market HVAC Buyer Audience Data",
-                           "High-intent Search / PPC", "SmartForecast CTV/OTT",
-                           "New-Mover & home-improver display", "Local Business Boost",
-                           "Missed-Call Text Back"],
-        "streaming_audio_note": "Geotarget streaming audio around home neighborhoods and "
-                                "home-improvement retail during morning and evening dayparts, "
-                                "when homeowners most notice comfort issues.",
-        "weather_triggers": triggers,
-        "monthly_plan": monthly_plan,
-        "geofence_locations": geofence,
-        "disclaimer": "Figures are Smart 1 Marketing planning baselines generated without live "
-                      "data, not exact counts. A strategist finalizes market data, budget, and "
-                      "geography before activation.",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -516,50 +370,21 @@ def _pdf_styles():
     return dict(body=body, h2=h2, title=title, eyebrow=eyebrow, small=small, cell=cell, cellw=cellw)
 
 
-def _store_report_pdf(pdf_bytes: bytes, company: str, base_url: str) -> str:
-    """Persist the PDF and return a public URL. Uploads to Cloudinary when
-    configured (permanent); otherwise writes to static/reports (ephemeral on Render)."""
-    slug = _slug(company) or "report"
-    stamp = int(time.time())
-    if CLOUDINARY_READY:
-        try:
-            # Stored as raw so the PDF is served/downloaded as-is (no image-delivery block).
-            public_id = f"{REPORT_ASSET_NAME}/{slug}-{stamp}.pdf"
-            res = cloudinary.uploader.upload(
-                io.BytesIO(pdf_bytes),
-                resource_type="raw",
-                public_id=public_id,
-                overwrite=True,
-                unique_filename=False,
-                use_filename=False,
-            )
-            url = res.get("secure_url", "")
-            if url:
-                return url
-        except Exception:
-            app.logger.exception("Cloudinary upload failed — falling back to local storage")
-    # Local fallback
-    os.makedirs(REPORT_DIR, exist_ok=True)
-    filename = f"{slug}-{stamp}.pdf"
-    with open(os.path.join(REPORT_DIR, filename), "wb") as fh:
-        fh.write(pdf_bytes)
-    base = base_url or PUBLIC_BASE_URL
-    return f"{base.rstrip('/')}/static/reports/{filename}" if base else f"/static/reports/{filename}"
-
-
 def build_report_pdf(report: dict, company: str, base_url: str) -> str:
-    """Render the report JSON to a branded PDF, store it (Cloudinary or local),
-    and return its public URL (or '' on failure)."""
+    """Render the report JSON to a branded PDF, save under static/reports,
+    and return its absolute public URL (or '' on failure)."""
     if not ENABLE_PDF:
         return ""
     try:
+        os.makedirs(REPORT_DIR, exist_ok=True)
         st = _pdf_styles()
         fmt = lambda n: f"{int(n):,}" if n is not None else "—"
         rng = lambda a, b: f"{fmt(a)}–{fmt(b)}"
         m = report.get("market_profile", {}) or {}
         rp = report.get("recommended_package", {}) or {}
 
-        buffer = io.BytesIO()
+        filename = f"{_slug(company)}-{int(time.time())}.pdf"
+        path = os.path.join(REPORT_DIR, filename)
 
         story = []
         story.append(Paragraph("SMART 1 MARKETING &nbsp;|&nbsp; HVAC COMFORT &amp; COMMAND PLAN", st["eyebrow"]))
@@ -602,7 +427,7 @@ def build_report_pdf(report: dict, company: str, base_url: str) -> str:
 
         trigs = report.get("weather_triggers", []) or []
         if trigs:
-            story.append(Paragraph("SmartForecast Weather Triggers", st["h2"]))
+            story.append(Paragraph("SmartClimate Weather Triggers", st["h2"]))
             story.append(Paragraph(" &nbsp;•&nbsp; ".join(trigs), st["body"]))
 
         plan = report.get("monthly_plan", []) or []
@@ -653,12 +478,13 @@ def build_report_pdf(report: dict, company: str, base_url: str) -> str:
         story.append(Spacer(1, 12))
         story.append(Paragraph(report.get("disclaimer", ""), st["small"]))
 
-        doc = SimpleDocTemplate(buffer, pagesize=letter, title=f"{company} HVAC Market Plan",
+        doc = SimpleDocTemplate(path, pagesize=letter, title=f"{company} HVAC Market Plan",
                                 leftMargin=0.6 * inch, rightMargin=0.6 * inch,
                                 topMargin=0.6 * inch, bottomMargin=0.6 * inch)
         doc.build(story)
 
-        return _store_report_pdf(buffer.getvalue(), company, base_url)
+        base = base_url or PUBLIC_BASE_URL
+        return f"{base.rstrip('/')}/static/reports/{filename}" if base else f"/static/reports/{filename}"
     except Exception:
         app.logger.exception("PDF generation failed")
         return ""
@@ -698,19 +524,81 @@ def send_webhook(payload: dict, report: Any, status: str, pdf_url: str = "") -> 
         app.logger.exception("Webhook delivery failed")
 
 
+# Value one-pager served to already-on-LSA (conquest) leads so the disqualify
+# screen delivers something useful now, not just a "you're on the list" message.
+BEYOND_LSA_HTML = """<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>3 Ways to Grow Beyond Google LSA | Smart 1 Marketing</title>
+<link href=\"https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800&display=swap\" rel=\"stylesheet\">
+<style>:root{--navy:#0a2240;--cool:#0a9ed6;--heat:#f2683c;--ink:#25364b;--muted:#68798c;--line:#dbe5ed}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#fdeee6 0,rgba(253,238,230,0) 380px),radial-gradient(circle at 85% 0,#dff2fb 0,rgba(223,242,251,0) 420px),#f3f7fa;font-family:Montserrat,Arial,sans-serif;color:var(--ink);line-height:1.6}
+.wrap{max-width:820px;margin:0 auto;padding:48px 22px 80px}
+.lock{display:inline-flex;align-items:center;gap:9px;font-size:.72rem;font-weight:800;letter-spacing:.14em;color:var(--navy);margin-bottom:20px}
+.mark{display:grid;place-items:center;width:32px;height:32px;border-radius:9px;background:var(--navy);color:#fff}
+.eyebrow{font-weight:800;letter-spacing:.14em;color:var(--heat);font-size:.72rem}
+h1{color:var(--navy);font-size:2.3rem;letter-spacing:-.03em;margin:.4rem 0 .6rem}
+.sub{color:var(--muted);font-size:1.02rem;max-width:640px}
+.card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:24px 26px;margin:18px 0;box-shadow:0 14px 40px rgba(10,34,64,.07)}
+.card h2{color:var(--navy);font-size:1.2rem;margin:0 0 6px;display:flex;gap:12px;align-items:center}
+.num{flex:0 0 auto;display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--heat);color:#fff;font-weight:800}
+.card p{margin:8px 0 0;color:#3a4b5e}
+.card .why{margin-top:10px;font-size:.86rem;color:var(--muted);border-left:3px solid var(--cool);padding-left:12px}
+.cta{background:var(--navy);border-radius:16px;padding:26px;text-align:center;color:#fff;margin-top:26px}
+.cta h3{margin:0 0 6px;font-size:1.3rem}.cta p{margin:0 0 16px;color:#c7d5e2}
+.cta a{display:inline-block;background:var(--heat);color:#fff;text-decoration:none;font-weight:800;padding:14px 26px;border-radius:10px}
+.foot{color:var(--muted);font-size:.75rem;margin-top:26px;border-top:1px solid var(--line);padding-top:16px}
+@media print{body{background:#fff}.cta{background:#0a2240 !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+</style></head><body><div class=\"wrap\">
+<div class=\"lock\"><span class=\"mark\">S1</span><span>SMART 1 MARKETING</span></div>
+<div class=\"eyebrow\">HVAC GROWTH BRIEF</div>
+<h1>3 Ways to Grow Beyond Google LSA</h1>
+<p class=\"sub\">You already own the highest-intent spot in search. Here's where the next wave of HVAC demand actually comes from — the homeowners LSA never shows you.</p>
+<div class=\"card\"><h2><span class=\"num\">1</span> Catch demand before they search</h2>
+<p>LSA only reaches people already typing \"AC repair near me.\" But most replacement decisions start days earlier, when a system struggles on the first 90&deg; day. SmartClimate&trade; Connected TV and display fire automatically on extreme-weather days and put you in the living room before the emergency search ever happens.</p>
+<div class=\"why\">Weather-triggered media pauses in mild weather, so you only pay on high-value days.</div></div>
+<div class=\"card\"><h2><span class=\"num\">2</span> Own the new-mover window</h2>
+<p>Households that moved in the last 6 months are ~5x more likely to buy home services — and they have no HVAC company yet. New-mover and home-improver audience data lets you be first in the door before a competitor's LSA ever gets the call.</p>
+<div class=\"why\">This is net-new pipeline LSA structurally cannot reach.</div></div>
+<div class=\"card\"><h2><span class=\"num\">3</span> Turn one-time calls into recurring revenue</h2>
+<p>Automated review generation after every ticket lifts your Google rating (lowering future acquisition cost), while Missed-Call Text Back and seasonal tune-up automation convert one-off repairs into maintenance-plan members who buy the eventual replacement from you.</p>
+<div class=\"why\">Lower cost per lead + higher lifetime value on the customers you already win.</div></div>
+<div class=\"cta\"><h3>Want this mapped to your market?</h3>
+<p>We'll build a conquest plan around your service area — free, no obligation.</p>
+<a href=\"__BOOKING_URL__\">Book my conquest strategy call</a></div>
+<p class=\"foot\">Smart 1 Marketing &middot; Media budgets are transparent and separate from software and management fees. Estimates are planning recommendations finalized with a strategist before activation.</p>
+</div></body></html>"""
+
+
 @app.get("/")
-def landing():
-    return render_template("landing.html")
-
-
-@app.get("/plan")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", booking_url=BOOKING_URL)
 
 
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.post("/api/capture")
+def capture():
+    """Capture-on-submit: fire a lead webhook the INSTANT the form is submitted,
+    before the AI report runs, so a slow or failed report never loses the lead."""
+    try:
+        payload = clean_payload(request.get_json(silent=True) or {})
+        payload["lead_type"] = payload.get("lead_type") or "qualified"
+        send_webhook(payload, None, "lead_received")
+        return jsonify({"ok": True})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception:
+        app.logger.exception("Capture failed")
+        return jsonify({"ok": False}), 500
+
+
+@app.get("/beyond-lsa")
+def beyond_lsa():
+    """Value one-pager shown to already-on-LSA (conquest) leads."""
+    return BEYOND_LSA_HTML.replace("__BOOKING_URL__", BOOKING_URL or "#")
 
 
 @app.post("/api/lead")
@@ -738,36 +626,31 @@ def lead():
 
 @app.post("/api/analyze")
 def analyze():
-    # Only a genuinely invalid submission (bad ZIP) is rejected. Everything else
-    # always returns a plan — if the AI call fails, we serve a baseline plan so
-    # the visitor never hits a dead-end error.
     try:
         payload = clean_payload(request.get_json(silent=True) or {})
+        report = generate_report(payload)
+        base_url = PUBLIC_BASE_URL or request.url_root
+        pdf_url = build_report_pdf(report, payload.get("company_name", "Market Plan"), base_url)
+        send_webhook(payload, report, "completed", pdf_url)
+        return jsonify({"ok": True, "report": report, "report_pdf_url": pdf_url})
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-
-    status = "completed"
-    try:
-        report = generate_report(payload)
-    except Exception:
-        app.logger.exception("AI generation failed — serving baseline plan")
-        report = fallback_report(payload)
-        report["_generated_by"] = "baseline"
-        status = "completed_baseline"
-
-    base_url = PUBLIC_BASE_URL or request.url_root
-    try:
-        pdf_url = build_report_pdf(report, payload.get("company_name", "Market Plan"), base_url)
-    except Exception:
-        app.logger.exception("PDF build failed — continuing without PDF")
-        pdf_url = ""
-
-    try:
-        send_webhook(payload, report, status, pdf_url)
-    except Exception:
-        app.logger.exception("Webhook delivery failed")
-
-    return jsonify({"ok": True, "report": report, "report_pdf_url": pdf_url})
+    except Exception as exc:
+        app.logger.exception("Analysis failed")
+        try:
+            send_webhook(clean_payload(request.get_json(silent=True) or {}), None, "failed")
+        except Exception:
+            pass
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "The plan could not be generated. Check the server configuration and try again.",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+            ),
+            500,
+        )
 
 
 if __name__ == "__main__":
