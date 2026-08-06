@@ -14,11 +14,14 @@ from openai import OpenAI
 # reportlab is pure-Python (no system libraries) so the PDF builder deploys
 # cleanly on Render's native Python runtime with no Docker/apt changes.
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas as _canvas
 from reportlab.platypus import (
+    HRFlowable,
+    PageBreak,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -335,13 +338,105 @@ def generate_report(payload: dict) -> Any:
 # from Smart 1 Suite. Guarded so any failure never blocks the lead/webhook.
 # ---------------------------------------------------------------------------
 
-NAVY = colors.HexColor("#0a2240")
-COOL = colors.HexColor("#0a9ed6")
+NAVY = colors.HexColor("#0d2240")
+TEAL = colors.HexColor("#16bcae")
+BLUE = colors.HexColor("#1f9ed6")
 HEAT = colors.HexColor("#f2683c")
-GREEN = colors.HexColor("#2dbb72")
-LINE = colors.HexColor("#dbe5ed")
-MUTED = colors.HexColor("#68798c")
-AQUA = colors.HexColor("#fff2ec")
+LINE = colors.HexColor("#e4e9ef")
+MUTED = colors.HexColor("#6b7c8e")
+CARD = colors.HexColor("#f8fbfd")
+INK = colors.HexColor("#25364b")
+QUOTE = colors.HexColor("#eaf7fb")
+LEADC = colors.HexColor("#33465a")
+PAGE_W, PAGE_H = letter
+
+# Fixed HVAC package menu (name/price must match generate_report + index.html).
+PACKAGE_TIERS = [
+    ("Starter", "$749/mo", "$749/month", "Comfort Starter",
+     "Get found first — Google LSA + high-intent Search foundation."),
+    ("Foundation", "$1,499/mo", "$1,499/month", "Local Comfort Foundation",
+     "Dominate one city — LSA + Search, LBB, Missed-Call Text Back, reviews."),
+    ("★ Recommended", "$3,499/mo", "$3,499/month", "Omnichannel Market Leader",
+     "Adds SmartClimate CTV + New-Mover display for replacement demand."),
+    ("Scale", "$6,500/mo", "$6,500/month", "Regional Domination",
+     "Full weather-triggered omnichannel across multiple markets."),
+]
+
+
+def _trigger_kind(label: str) -> str:
+    l = (label or "").lower()
+    if any(k in l for k in ["heat", "humid", "warm", "90", "85", "sun"]):
+        return "hot"
+    if any(k in l for k in ["freez", "frost", "cold", "snow", "ice", "32"]):
+        return "cold"
+    return "neutral"
+
+
+class ProposalCanvas(_canvas.Canvas):
+    """Draws the navy header band (tall title band on page 1, slim on later
+    pages) plus a footer with a page counter on every page."""
+
+    company = ""
+    title_line = "HVAC Comfort & Command Proposal"
+    subtitle = "Weather-triggered advertising plan prepared for your market"
+    footer = ("Smart 1 Marketing  ·  Weather-triggered plan based on AI "
+              "market estimates. Verify locations and figures before activation.")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved = []
+
+    def showPage(self):
+        self._saved.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        total = len(self._saved)
+        for i, state in enumerate(self._saved):
+            self.__dict__.update(state)
+            self._draw_decoration(i + 1, total)
+            super().showPage()
+        super().save()
+
+    def _draw_decoration(self, page, total):
+        w, h = PAGE_W, PAGE_H
+        band = 78 if page == 1 else 54
+        # header band + teal accent
+        self.setFillColor(NAVY)
+        self.rect(0, h - band, w, band, fill=1, stroke=0)
+        self.setFillColor(TEAL)
+        self.rect(0, h - band - 5, w, 5, fill=1, stroke=0)
+        # logo lockup: SMART(1)MARKETING with a teal "1"
+        y = h - 30
+        self.setFont("Helvetica-Bold", 13)
+        x = 40
+        self.setFillColor(colors.white)
+        self.drawString(x, y, "SMART")
+        x += self.stringWidth("SMART", "Helvetica-Bold", 13)
+        self.setFillColor(TEAL)
+        self.drawString(x, y, "1")
+        x += self.stringWidth("1", "Helvetica-Bold", 13)
+        self.setFillColor(colors.white)
+        self.drawString(x, y, "MARKETING")
+        if page == 1:
+            self.setFont("Helvetica-Bold", 17)
+            self.setFillColor(colors.white)
+            self.drawString(40, h - 56, self.title_line)
+            self.setFont("Helvetica", 9)
+            self.setFillColor(colors.HexColor("#b9c6d6"))
+            self.drawString(40, h - 70, self.subtitle)
+        else:
+            self.setFont("Helvetica-Bold", 9)
+            self.setFillColor(colors.HexColor("#c3d0de"))
+            self.drawRightString(w - 40, h - 27, self.company or "")
+        # footer
+        self.setStrokeColor(colors.HexColor("#e0e6ec"))
+        self.setLineWidth(0.5)
+        self.line(40, 42, w - 40, 42)
+        self.setFont("Helvetica", 7)
+        self.setFillColor(colors.HexColor("#9aa7b4"))
+        self.drawString(40, 30, self.footer)
+        self.drawRightString(w - 40, 30, f"{page} / {total}")
 
 
 def _money_to_int(value: str):
@@ -362,126 +457,310 @@ def _pdf_styles():
                         fontSize=13, leading=16, textColor=NAVY, spaceBefore=16, spaceAfter=6)
     title = ParagraphStyle("s1title", parent=ss["Title"], fontName="Helvetica-Bold",
                            fontSize=22, leading=25, textColor=NAVY, alignment=TA_LEFT, spaceAfter=4)
-    eyebrow = ParagraphStyle("s1eye", parent=body, fontName="Helvetica-Bold",
-                             fontSize=8, textColor=HEAT, spaceAfter=2)
-    small = ParagraphStyle("s1small", parent=body, fontSize=8, textColor=MUTED, leading=11)
-    cell = ParagraphStyle("s1cell", parent=body, fontSize=8, leading=10.5)
-    cellw = ParagraphStyle("s1cellw", parent=cell, textColor=colors.white)
-    return dict(body=body, h2=h2, title=title, eyebrow=eyebrow, small=small, cell=cell, cellw=cellw)
+    grey = colors.HexColor("#93a0ad")
+
+    def S(name, **kw):
+        return ParagraphStyle(name, parent=body, **kw)
+
+    return dict(
+        body=body, h2=h2, title=title,
+        by=S("by", fontName="Helvetica", fontSize=8.5, textColor=MUTED, spaceAfter=2),
+        lead=S("lead", fontName="Helvetica", fontSize=9.5, leading=12.5, textColor=LEADC,
+               alignment=TA_JUSTIFY, spaceAfter=4),
+        seclabel=S("sl", fontName="Helvetica-Bold", fontSize=7.5, textColor=grey, leading=10),
+        metaL=S("ml", fontName="Helvetica-Bold", fontSize=6, textColor=grey, leading=8),
+        metaV=S("mv", fontName="Helvetica-Bold", fontSize=9.5, textColor=NAVY, leading=13),
+        badge=S("bd", fontName="Helvetica-Bold", fontSize=9, textColor=colors.white, leading=12),
+        statN=S("sn", fontName="Helvetica-Bold", fontSize=13, textColor=NAVY, alignment=TA_CENTER, leading=16),
+        statL=S("stl", fontName="Helvetica", fontSize=7, textColor=MUTED, alignment=TA_CENTER, leading=9),
+        tcap=S("tc", fontName="Helvetica-Bold", fontSize=6, textColor=grey, alignment=TA_CENTER, leading=8),
+        tcapR=S("tcr", fontName="Helvetica-Bold", fontSize=6, textColor=HEAT, alignment=TA_CENTER, leading=8),
+        tprice=S("tp", fontName="Helvetica-Bold", fontSize=12, textColor=NAVY, alignment=TA_CENTER, leading=15),
+        tname=S("tn", fontName="Helvetica-Bold", fontSize=7.5, textColor=INK, alignment=TA_CENTER, leading=9),
+        tblurb=S("tb", fontName="Helvetica", fontSize=6.2, textColor=MUTED, alignment=TA_CENTER, leading=8),
+        rec=S("rc", fontName="Helvetica", fontSize=9.5, leading=14, textColor=INK),
+        note=S("nt", fontName="Helvetica", fontSize=8.5, leading=13, textColor=colors.HexColor("#2c3e50")),
+        pay=S("py", fontName="Helvetica", fontSize=8.8, leading=13, textColor=INK),
+        darkEye=S("de", fontName="Helvetica-Bold", fontSize=7, textColor=TEAL, leading=10),
+        darkH=S("dh", fontName="Helvetica-Bold", fontSize=12.5, textColor=colors.white, leading=15, spaceAfter=4),
+        darkP=S("dp", fontName="Helvetica", fontSize=8.5, leading=13, textColor=colors.HexColor("#c3d0de")),
+        darkLi=S("dl", fontName="Helvetica", fontSize=8.3, leading=13, textColor=colors.HexColor("#dbe4ee")),
+        tile=S("ti", fontName="Helvetica-Bold", fontSize=9, textColor=colors.white, alignment=TA_CENTER),
+        mc=S("mc", fontName="Helvetica-Bold", fontSize=8.5, textColor=NAVY, leading=11),
+        subH=S("sh", fontName="Helvetica-Bold", fontSize=8.3, textColor=NAVY, leading=11, spaceBefore=6),
+        subP=S("sp", fontName="Helvetica", fontSize=8.3, leading=12, textColor=colors.HexColor("#4a5b6c")),
+        cellw=S("cw", fontName="Helvetica-Bold", fontSize=7.5, textColor=colors.white, leading=10),
+        cell=S("cl", fontName="Helvetica", fontSize=8, leading=10.5, textColor=LEADC),
+        cellb=S("cb", fontName="Helvetica-Bold", fontSize=8, leading=10.5, textColor=NAVY),
+        cellm=S("cm", fontName="Helvetica", fontSize=7, leading=9.5, textColor=MUTED),
+        ctaH=S("ch", fontName="Helvetica-Bold", fontSize=13, textColor=colors.white, leading=16, spaceAfter=3),
+        ctaP=S("cta_p", fontName="Helvetica", fontSize=8.6, leading=13, textColor=colors.HexColor("#c3d0de")),
+        ctaA=S("ca", fontName="Helvetica-Bold", fontSize=9, textColor=TEAL, spaceBefore=6),
+        disc=S("ds", fontName="Helvetica-Oblique", fontSize=7, leading=10, textColor=grey),
+    )
 
 
-def build_report_pdf(report: dict, company: str, base_url: str) -> str:
-    """Render the report JSON to a branded PDF, save under static/reports,
-    and return its absolute public URL (or '' on failure)."""
+def build_report_pdf(report: dict, company: str, base_url: str, inputs: dict = None) -> str:
+    """Render the report JSON to a branded multi-page proposal PDF, save under
+    static/reports, and return its absolute public URL (or '' on failure)."""
     if not ENABLE_PDF:
         return ""
     try:
+        inputs = inputs or {}
         os.makedirs(REPORT_DIR, exist_ok=True)
         st = _pdf_styles()
         fmt = lambda n: f"{int(n):,}" if n is not None else "—"
         rng = lambda a, b: f"{fmt(a)}–{fmt(b)}"
         m = report.get("market_profile", {}) or {}
         rp = report.get("recommended_package", {}) or {}
+        CW = PAGE_W - 80  # content width between 40pt margins
 
         filename = f"{_slug(company)}-{int(time.time())}.pdf"
         path = os.path.join(REPORT_DIR, filename)
 
+        def seclabel(txt):
+            return [Spacer(1, 5), Paragraph(txt.upper(), st["seclabel"]),
+                    HRFlowable(width="100%", thickness=0.6, color=LINE, spaceBefore=4, spaceAfter=7)]
+
         story = []
-        story.append(Paragraph("SMART 1 MARKETING &nbsp;|&nbsp; HVAC COMFORT &amp; COMMAND PLAN", st["eyebrow"]))
+        # ---- PAGE 1 ----
         story.append(Paragraph(company or "Market Plan", st["title"]))
-        story.append(Paragraph(report.get("market_summary", ""), st["body"]))
-        story.append(Spacer(1, 6))
+        story.append(Paragraph("Prepared by Smart 1 Marketing  ·  " + time.strftime("%B %d, %Y"), st["by"]))
 
-        if report.get("market_type"):
-            story.append(Paragraph(f"<b>{report.get('market_type')}</b> — {report.get('market_type_description','')}", st["small"]))
+        lsa_map = {"yes_active": "Running now", "paused": "Paused",
+                   "no": "Not yet running", "unsure": "To be confirmed"}
+        market_cell = f"{inputs.get('company_zip', '—')} · {inputs.get('service_radius', '—')}"
+        meta = [
+            ("Market", market_cell),
+            ("Est. Replacement-Ready HH", rng(m.get("estimated_replacement_opportunity_low"), m.get("estimated_replacement_opportunity_high"))),
+            ("Recommended Plan", rp.get("monthly_investment", "—")),
+            ("Media Approach", "Weather-triggered"),
+            ("Budget Pacing", "Peak / Shoulder / Mild"),
+            ("Google LSA Status", lsa_map.get(inputs.get("lsa_status", ""), "To be confirmed")),
+        ]
+        mcell = lambda l, v: [Paragraph(l.upper(), st["metaL"]), Spacer(1, 2), Paragraph(v, st["metaV"])]
+        meta_tbl = Table(
+            [[mcell(*meta[0]), mcell(*meta[1]), mcell(*meta[2])],
+             [mcell(*meta[3]), mcell(*meta[4]), mcell(*meta[5])]],
+            colWidths=[CW / 3] * 3)
+        meta_tbl.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.8, LINE),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 14), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 13), ("BOTTOMPADDING", (0, 0), (-1, -1), 13),
+        ]))
+        story.append(Spacer(1, 10))
+        story.append(meta_tbl)
 
-        stat_data = [[
-            Paragraph(f"<b>{rng(m.get('estimated_population_low'), m.get('estimated_population_high'))}</b><br/><font size=7 color='#68798c'>ESTIMATED POPULATION</font>", st["cell"]),
-            Paragraph(f"<b>{rng(m.get('estimated_homeowner_households_low'), m.get('estimated_homeowner_households_high'))}</b><br/><font size=7 color='#68798c'>HOMEOWNER HOUSEHOLDS</font>", st["cell"]),
-            Paragraph(f"<b>{rng(m.get('estimated_replacement_opportunity_low'), m.get('estimated_replacement_opportunity_high'))}</b><br/><font size=7 color='#68798c'>REPLACEMENT-READY HOMES</font>", st["cell"]),
-        ]]
-        stat = Table(stat_data, colWidths=[2.4 * inch] * 3)
-        stat.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), AQUA),
-            ("BOX", (0, 0), (-1, -1), 0.5, LINE),
-            ("INNERGRID", (0, 0), (-1, -1), 0.5, LINE),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 10),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        btext = report.get("market_type", "Market")
+        bw = min(CW, len(btext) * 5.7 + 34)
+        badge = Table([[Paragraph(btext, st["badge"])]], colWidths=[bw])
+        badge.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), NAVY),
+            ("LEFTPADDING", (0, 0), (-1, -1), 16), ("RIGHTPADDING", (0, 0), (-1, -1), 16),
+            ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
         ]))
         story.append(Spacer(1, 8))
+        story.append(badge)
+        story.append(Spacer(1, 5))
+        story.append(Paragraph(report.get("market_type_description", ""), st["lead"]))
+        story.append(Paragraph(report.get("market_summary", ""), st["lead"]))
+
+        story.extend(seclabel("Market Estimate"))
+        scell = lambda num, lab: [Paragraph(num, st["statN"]), Spacer(1, 4), Paragraph(lab, st["statL"])]
+        gap, cw3 = 12, (CW - 24) / 3
+        stat = Table([[
+            scell(rng(m.get("estimated_population_low"), m.get("estimated_population_high")), "Estimated population"), "",
+            scell(rng(m.get("estimated_homeowner_households_low"), m.get("estimated_homeowner_households_high")), "Homeowner households"), "",
+            scell(rng(m.get("estimated_replacement_opportunity_low"), m.get("estimated_replacement_opportunity_high")), "Replacement-ready homes"),
+        ]], colWidths=[cw3, gap, cw3, gap, cw3])
+        stat.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 11), ("BOTTOMPADDING", (0, 0), (-1, -1), 11),
+        ] + [c for i in (0, 2, 4) for c in (
+            ("BACKGROUND", (i, 0), (i, 0), CARD), ("BOX", (i, 0), (i, 0), 0.8, LINE))]))
         story.append(stat)
 
-        story.append(Paragraph("Your Market Opportunity", st["h2"]))
-        story.append(Paragraph(report.get("market_opportunity", ""), st["body"]))
+        story.extend(seclabel("Your Market Opportunity"))
+        story.append(Paragraph(report.get("market_opportunity", ""), st["lead"]))
 
-        story.append(Paragraph("Recommended Package", st["h2"]))
-        story.append(Paragraph(f"<b>{rp.get('monthly_investment','')} — {rp.get('package_name','')}</b>", st["body"]))
-        story.append(Paragraph(rp.get("description", ""), st["small"]))
+        story.extend(seclabel("Investment Tiers (Foundation / Recommended / Scale)"))
+        rec_i = 2
+        for i, tier in enumerate(PACKAGE_TIERS):
+            if (rp.get("package_name", "").strip().lower() == tier[3].lower()
+                    or rp.get("monthly_investment", "").replace(" ", "") == tier[2].replace(" ", "")):
+                rec_i = i
+        tgap, tcw = 8, (CW - 24) / 4
+
+        def tier_cell(tier, is_rec):
+            return [Paragraph(tier[0], st["tcapR"] if is_rec else st["tcap"]), Spacer(1, 5),
+                    Paragraph(tier[1], st["tprice"]), Spacer(1, 3),
+                    Paragraph(tier[3], st["tname"]), Spacer(1, 6),
+                    Paragraph(tier[4], st["tblurb"])]
+        trow = []
+        for i, tier in enumerate(PACKAGE_TIERS):
+            trow.append(tier_cell(tier, i == rec_i))
+            if i < 3:
+                trow.append("")
+        tiers = Table([trow], colWidths=[tcw, tgap, tcw, tgap, tcw, tgap, tcw])
+        tstyle = [("VALIGN", (0, 0), (-1, -1), "TOP"),
+                  ("TOPPADDING", (0, 0), (-1, -1), 10), ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+                  ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8)]
+        for ci in (0, 2, 4, 6):
+            tstyle.append(("BOX", (ci, 0), (ci, 0), 0.8, LINE))
+        rc = rec_i * 2
+        tstyle.append(("BACKGROUND", (rc, 0), (rc, 0), colors.HexColor("#fff8f4")))
+        tstyle.append(("BOX", (rc, 0), (rc, 0), 1.4, HEAT))
+        tiers.setStyle(TableStyle(tstyle))
+        story.append(tiers)
+
+        story.append(Spacer(1, 10))
+        story.append(Paragraph(f"<b>Recommended: {rp.get('monthly_investment','')} — {rp.get('package_name','')}.</b> {rp.get('description','')}", st["rec"]))
+        mo = _money_to_int(rp.get("monthly_investment", ""))
+        if mo:
+            jobs = max(1, -(-mo // 6000))
+            story.append(Spacer(1, 5))
+            story.append(Paragraph(
+                f'<b>Does this pay for itself?</b> At a $6,000 average completed-job value, about '
+                f'<font color="#f2683c"><b>{jobs} new job{"s" if jobs > 1 else ""} a month</b></font> '
+                f'covers the entire {rp.get("monthly_investment","")} plan — everything after that is added profit.',
+                st["pay"]))
+        nb = Table([[Paragraph("This is a suggested budget based on your market's size. In a quick consult we'll tailor a budget and plan that fits your company's goals, capacity, and cash flow.", st["note"])]], colWidths=[CW])
+        nb.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), QUOTE), ("LINEBEFORE", (0, 0), (0, -1), 3, TEAL),
+            ("LEFTPADDING", (0, 0), (-1, -1), 16), ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+            ("TOPPADDING", (0, 0), (-1, -1), 11), ("BOTTOMPADDING", (0, 0), (-1, -1), 11)]))
+        story.append(Spacer(1, 9))
+        story.append(nb)
+
+        # ---- PAGE 2 ----
+        story.append(PageBreak())
+        story.extend(seclabel("How This Saves You Money"))
+        bullets = [
+            "Pauses spend on mild, low-demand days instead of paying for empty impressions.",
+            "Targets in-market homeowners and new movers instead of broadcasting to the whole metro.",
+            "Rolls unused shoulder-season budget forward instead of losing it to a fixed monthly buy.",
+            "Covers emergency repair, system replacement, and retention from one budget — not three campaigns.",
+        ]
+        dark_flow = [Paragraph("WHY THIS SAVES YOU MONEY", st["darkEye"]),
+                     Paragraph("Spend on the days demand is real, not on a flat calendar.", st["darkH"]),
+                     Paragraph("Traditional radio, print, and always-on digital bill you every week regardless of the forecast. A weather-triggered plan concentrates budget on high-intent days.", st["darkP"]),
+                     Spacer(1, 6)]
+        for b in bullets:
+            dark_flow.append(Paragraph(f'<font color="#16bcae"><b>+</b></font>&nbsp;&nbsp;{b}', st["darkLi"]))
+            dark_flow.append(Spacer(1, 3))
+        dk = Table([[dark_flow]], colWidths=[CW])
+        dk.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), NAVY),
+            ("LEFTPADDING", (0, 0), (-1, -1), 22), ("RIGHTPADDING", (0, 0), (-1, -1), 22),
+            ("TOPPADDING", (0, 0), (-1, -1), 20), ("BOTTOMPADDING", (0, 0), (-1, -1), 16)]))
+        story.append(dk)
 
         chans = report.get("media_channels", []) or []
         if chans:
-            story.append(Paragraph("Recommended Media Channels", st["h2"]))
-            story.append(Paragraph(" &nbsp;•&nbsp; ".join(chans), st["body"]))
+            story.extend(seclabel("Recommended Media Channels"))
+            mgap = 12
+            mcw = (CW - mgap) / 2
+
+            def channel_card(name, idx):
+                letter = next((c for c in name if c.isalnum()), "•").upper()
+                tile = Table([[Paragraph(letter, st["tile"])]], colWidths=[22], rowHeights=[22])
+                tile.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, -1), TEAL if idx % 2 else BLUE),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+                card = Table([[tile, Paragraph(name, st["mc"])]], colWidths=[30, mcw - 30 - 24])
+                card.setStyle(TableStyle([
+                    ("BOX", (0, 0), (-1, -1), 0.8, LINE), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+                    ("TOPPADDING", (0, 0), (-1, -1), 11), ("BOTTOMPADDING", (0, 0), (-1, -1), 11)]))
+                return card
+            cards = [channel_card(c, i) for i, c in enumerate(chans)]
+            mrows = []
+            for i in range(0, len(cards), 2):
+                mrows.append([cards[i], "", cards[i + 1] if i + 1 < len(cards) else ""])
+            mtbl = Table(mrows, colWidths=[mcw, mgap, mcw])
+            mtbl.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                      ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                                      ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+            story.append(mtbl)
+
+        if report.get("streaming_audio_note"):
+            story.extend(seclabel("Streaming Audio — Neighborhood Daypart"))
+            story.append(Paragraph(report.get("streaming_audio_note", ""), st["lead"]))
 
         trigs = report.get("weather_triggers", []) or []
         if trigs:
-            story.append(Paragraph("SmartClimate Weather Triggers", st["h2"]))
-            story.append(Paragraph(" &nbsp;•&nbsp; ".join(trigs), st["body"]))
+            story.extend(seclabel("Recommended Weather Triggers"))
+            toks = []
+            for t in trigs:
+                k = _trigger_kind(t)
+                col = "#b6482a" if k == "hot" else ("#166a8f" if k == "cold" else "#0d2240")
+                toks.append(f'<font color="{col}"><b>{t}</b></font>')
+            story.append(Paragraph("&nbsp;&nbsp;·&nbsp;&nbsp;".join(toks), st["mc"]))
 
+        # ---- PAGE 3 ----
         plan = report.get("monthly_plan", []) or []
         if plan:
-            story.append(Paragraph("Month-by-Month Campaign Plan", st["h2"]))
-            rows = [[Paragraph("<b>Month</b>", st["cellw"]), Paragraph("<b>Focus</b>", st["cellw"]), Paragraph("<b>Budget Pacing</b>", st["cellw"])]]
+            story.append(PageBreak())
+            story.extend(seclabel("Month-by-Month Campaign Plan"))
+            rows = [[Paragraph("Month", st["cellw"]), Paragraph("Focus &amp; Message", st["cellw"]), Paragraph("Budget Pacing", st["cellw"])]]
             for x in plan:
-                rows.append([
-                    Paragraph(x.get("month", ""), st["cell"]),
-                    Paragraph(x.get("focus", ""), st["cell"]),
-                    Paragraph(x.get("pacing", ""), st["cell"]),
-                ])
-            t = Table(rows, colWidths=[1.1 * inch, 3.3 * inch, 2.8 * inch], repeatRows=1)
+                fm = [Paragraph(x.get("focus", ""), st["cellb"]), Paragraph(x.get("message", ""), st["cellm"])]
+                rows.append([Paragraph(x.get("month", ""), st["cell"]), fm, Paragraph(x.get("pacing", ""), st["cell"])])
+            t = Table(rows, colWidths=[78, CW - 78 - 150, 150], repeatRows=1)
             t.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fbfc")]),
-                ("GRID", (0, 0), (-1, -1), 0.5, LINE),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+                ("LINEBELOW", (0, 0), (-1, -1), 0.5, LINE),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ]))
+                ("LEFTPADDING", (0, 0), (-1, -1), 11), ("RIGHTPADDING", (0, 0), (-1, -1), 11),
+                ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
             story.append(t)
 
+        # ---- PAGE 4 ----
         geo = sorted(report.get("geofence_locations", []) or [], key=lambda g: g.get("priority", 3))
+        story.append(PageBreak())
         if geo:
-            story.append(Paragraph("Recommended Targets & Geofences", st["h2"]))
-            rows = [[Paragraph(f"<b>{h}</b>", st["cellw"]) for h in ("P", "Location", "Category", "Method", "Radius", "Conf.")]]
+            story.extend(seclabel("Sample Targets &amp; Geofences"))
+            rows = [[Paragraph(h, st["cellw"]) for h in ("P", "Location", "Category", "Method", "Radius")]]
             for g in geo:
+                loc = [Paragraph(g.get("name", ""), st["cellb"]), Paragraph(g.get("city_state", ""), st["cellm"])]
                 rows.append([
-                    Paragraph(f"P{g.get('priority','')}", st["cell"]),
-                    Paragraph(f"<b>{g.get('name','')}</b><br/>{g.get('city_state','')}", st["cell"]),
+                    Paragraph(f"P{g.get('priority','')}", st["cell"]), loc,
                     Paragraph(g.get("category", ""), st["cell"]),
                     Paragraph(str(g.get("recommended_method", "")).replace("_", " "), st["cell"]),
                     Paragraph(f"{g.get('recommended_radius_miles','')} mi", st["cell"]),
-                    Paragraph(g.get("confidence", ""), st["cell"]),
                 ])
-            t = Table(rows, colWidths=[0.4 * inch, 2.2 * inch, 1.5 * inch, 1.3 * inch, 0.7 * inch, 0.6 * inch], repeatRows=1)
+            t = Table(rows, colWidths=[36, CW - 36 - 150 - 108 - 58, 150, 108, 58], repeatRows=1)
             t.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fbfc")]),
-                ("GRID", (0, 0), (-1, -1), 0.5, LINE),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+                ("LINEBELOW", (0, 0), (-1, -1), 0.5, LINE),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ]))
+                ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
             story.append(t)
 
-        story.append(Spacer(1, 12))
-        story.append(Paragraph(report.get("disclaimer", ""), st["small"]))
+        story.extend(seclabel("Talk to a Strategist"))
+        book = BOOKING_URL or "https://smart1marketing.com"
+        cta_flow = [Paragraph("Ready to turn this into a live campaign?", st["ctaH"]),
+                    Paragraph("A Smart 1 strategist will verify these locations, build your audiences, and tailor a budget that fits your company — free, no obligation.", st["ctaP"]),
+                    Paragraph(f"Book a consult:&nbsp; {book}", st["ctaA"])]
+        cta = Table([[cta_flow]], colWidths=[CW])
+        cta.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), NAVY),
+            ("LEFTPADDING", (0, 0), (-1, -1), 24), ("RIGHTPADDING", (0, 0), (-1, -1), 24),
+            ("TOPPADDING", (0, 0), (-1, -1), 22), ("BOTTOMPADDING", (0, 0), (-1, -1), 22)]))
+        story.append(cta)
+        story.append(Spacer(1, 14))
+        story.append(Paragraph(report.get("disclaimer", ""), st["disc"]))
 
-        doc = SimpleDocTemplate(path, pagesize=letter, title=f"{company} HVAC Market Plan",
-                                leftMargin=0.6 * inch, rightMargin=0.6 * inch,
-                                topMargin=0.6 * inch, bottomMargin=0.6 * inch)
-        doc.build(story)
+        ProposalCanvas.company = company or ""
+        doc = SimpleDocTemplate(path, pagesize=letter, title=f"{company} HVAC Comfort & Command Proposal",
+                                leftMargin=40, rightMargin=40, topMargin=86, bottomMargin=48)
+        doc.build(story, canvasmaker=ProposalCanvas)
 
         base = base_url or PUBLIC_BASE_URL
         return f"{base.rstrip('/')}/static/reports/{filename}" if base else f"/static/reports/{filename}"
@@ -630,7 +909,7 @@ def analyze():
         payload = clean_payload(request.get_json(silent=True) or {})
         report = generate_report(payload)
         base_url = PUBLIC_BASE_URL or request.url_root
-        pdf_url = build_report_pdf(report, payload.get("company_name", "Market Plan"), base_url)
+        pdf_url = build_report_pdf(report, payload.get("company_name", "Market Plan"), base_url, payload)
         send_webhook(payload, report, "completed", pdf_url)
         return jsonify({"ok": True, "report": report, "report_pdf_url": pdf_url})
     except ValueError as exc:
