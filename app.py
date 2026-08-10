@@ -14,14 +14,11 @@ from openai import OpenAI
 # reportlab is pure-Python (no system libraries) so the PDF builder deploys
 # cleanly on Render's native Python runtime with no Docker/apt changes.
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.pdfgen import canvas as _canvas
 from reportlab.platypus import (
-    HRFlowable,
-    PageBreak,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -34,14 +31,28 @@ load_dotenv()
 app = Flask(__name__)
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-WEBHOOK_URL = os.getenv("SMART1_WEBHOOK_URL", "").strip()
+# Standardized on GHL_WEBHOOK_URL. SMART1_WEBHOOK_URL is still read as a fallback
+# so older deployments keep working until they switch the env var over.
+WEBHOOK_URL = (os.getenv("GHL_WEBHOOK_URL") or os.getenv("SMART1_WEBHOOK_URL") or "").strip()
 # Absolute base used to build the public report_pdf_url (e.g. https://smart1hvac.onrender.com).
-# If empty, the app derives it from the incoming request.
+# If empty, the app derives it from the incoming request. Ignored when Cloudinary is configured.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 ENABLE_PDF = os.getenv("ENABLE_PDF", "1").strip() not in ("0", "false", "False", "")
 REPORT_DIR = os.path.join(app.static_folder, "reports")
-# Your GHL / calendar booking link, shown as the primary CTA on the report.
-BOOKING_URL = os.getenv("BOOKING_URL", "").strip()
+
+# Cloudinary — permanent storage for the generated PDF reports. The SDK reads the
+# CLOUDINARY_URL env var automatically (cloudinary://<key>:<secret>@<cloud_name>).
+# All report PDFs are stored under the "hvac-report" folder/name.
+REPORT_ASSET_NAME = "hvac-report"
+CLOUDINARY_READY = False
+if os.getenv("CLOUDINARY_URL", "").strip():
+    try:
+        import cloudinary
+        import cloudinary.uploader
+        cloudinary.config(secure=True)  # auto-configures from CLOUDINARY_URL
+        CLOUDINARY_READY = True
+    except Exception:
+        app.logger.exception("Cloudinary configuration failed; using local PDF storage")
 
 SYSTEM_PROMPT = """
 You are the Smart 1 Marketing HVAC "Comfort & Command" Market Intelligence Architect.
@@ -59,7 +70,7 @@ IMPORTANT ACCURACY RULES
 CORE STRATEGY — TWO DEMAND PIPELINES
 1. Always-On Emergency Capture: Google Local Services Ads (LSA / "Google Guaranteed") + high-intent Search/PPC,
    backed by Missed-Call Text Back so a call they cannot answer never becomes a competitor's job.
-2. SmartClimate Weather-Triggered Demand: CTV/OTT and programmatic display that automatically switch ON during
+2. SmartForecast Weather-Triggered Demand: CTV/OTT and programmatic display that automatically switch ON during
    extreme heat and cold and PAUSE in mild weather, preserving budget for high-value days. Layer New-Mover and
    home-improver audience data to build a replacement-system pipeline.
 
@@ -67,7 +78,7 @@ LSA AWARENESS
 - The input includes lsa_status. If it is 'no', 'paused', or 'unsure', the plan MUST prioritize claiming and
   optimizing the Google LSA (Google Guaranteed) profile as the #1 move. Do not assume they already have it.
 - If lsa_status is 'yes_active', treat this as a conquest scenario: they already own the LSA spot, so lead with
-  SmartClimate CTV, New-Mover, and programmatic display to expand beyond LSA.
+  SmartForecast CTV, New-Mover, and programmatic display to expand beyond LSA.
 
 ALLOWED CHANNELS / DATA ONLY
 - Google LSA, high-intent Search/PPC, CTV/OTT, programmatic / data-driven targeted display, New-Mover &
@@ -265,7 +276,9 @@ def generate_report(payload: dict) -> Any:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured.")
-    client = OpenAI(api_key=api_key)
+    # Hard timeout + a single retry so a slow/hung model response fails fast into
+    # the baseline plan instead of tying up the gunicorn worker (which would 500).
+    client = OpenAI(api_key=api_key, timeout=90, max_retries=1)
     user_prompt = (
         "\nBuild a weather-triggered HVAC Comfort & Command Demand & Targeting Report from these inputs:\n"
         f"{json.dumps(payload, indent=2)}"
@@ -290,10 +303,10 @@ def generate_report(payload: dict) -> Any:
         "    * $749/month — Comfort Starter (brand-new or single-truck: LSA + high-intent Search foundation)\n"
         "    * $1,499/month — Local Comfort Foundation (dominate one city: LSA + Search mgmt, Local Business Boost, "
         "Missed-Call Text Back, automated reviews)\n"
-        "    * $3,499/month — Omnichannel Market Leader (adds SmartClimate CTV + New-Mover & home-improver display)\n"
+        "    * $3,499/month — Omnichannel Market Leader (adds SmartForecast CTV + New-Mover & home-improver display)\n"
         "    * $6,500/month — Regional Domination (multi-market full weather-triggered omnichannel at scale)\n"
         "- media_channels: ALLOWED channels/data only. ALWAYS include 'Google LSA (Google Guaranteed)' and 'In-Market "
-        "HVAC Buyer Audience Data' as chips. Then choose from: high-intent Search/PPC, SmartClimate CTV/OTT, New-Mover & "
+        "HVAC Buyer Audience Data' as chips. Then choose from: high-intent Search/PPC, SmartForecast CTV/OTT, New-Mover & "
         "home-improver display, programmatic targeted display, streaming audio, YouTube/online video, website retargeting, "
         "Local Business Boost, Missed-Call Text Back. Return 5-8 chips total. NEVER include paid social, email, or SMS.\n"
         "- streaming_audio_note: a short recommendation to geotarget streaming audio around home neighborhoods and "
@@ -334,109 +347,149 @@ def generate_report(payload: dict) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Deterministic fallback plan — used only if the AI call fails for any reason
+# (missing/invalid key, model access, rate limit, timeout). Guarantees the
+# visitor always gets a usable proposal instead of a dead-end error.
+# ---------------------------------------------------------------------------
+
+def _recommend_tier(payload: dict):
+    radius = int(re.sub(r"[^\d]", "", payload.get("service_radius", "")) or "15")
+    loc = payload.get("locations", "1")
+    obj = (payload.get("objectives", "") or "").lower()
+    focus = payload.get("revenue_focus", "")
+    if "just launched" in obj or "getting started" in obj or "scratch" in obj:
+        return ("Comfort Starter", "$749/month", 749)
+    if loc == "4+" or radius >= 60:
+        return ("Regional Domination", "$6,500/month", 6500)
+    if (radius >= 40 or loc == "2-3" or "replacement" in obj or "awareness" in obj
+            or "commercial" in obj or "movers" in obj or focus == "System replacement"):
+        return ("Omnichannel Market Leader", "$3,499/month", 3499)
+    return ("Local Comfort Foundation", "$1,499/month", 1499)
+
+
+def fallback_report(payload: dict) -> dict:
+    company = payload.get("company_name", "your company")
+    zip_code = payload.get("company_zip", "your area")
+    radius = int(re.sub(r"[^\d]", "", payload.get("service_radius", "")) or "15")
+    name, price, monthly = _recommend_tier(payload)
+
+    # Rough, clearly-labeled baseline estimates that scale with service radius.
+    hh_base = max(8000, radius * 1400)
+    homeowner = int(hh_base * 0.62)
+    replacement = int(homeowner * 0.28)
+    pop_base = int(hh_base * 2.5)
+
+    def rng(v):
+        return int(v * 0.8), v, int(v * 1.2)
+
+    pop = rng(pop_base); hh = rng(hh_base); own = rng(homeowner); rep = rng(replacement)
+
+    triggers = ["90°+ heat wave", "Heat advisory", "Humidity spike", "First hard freeze",
+                "Cold snap", "First frost", "Holiday-weekend forecast", "Seasonal changeover"]
+
+    peak = {"Jun", "Jul", "Aug", "Sep", "Dec", "Jan", "Feb"}
+    shoulder = {"Apr", "May", "Oct", "Nov"}
+    months = ["January", "February", "March", "April", "May", "June",
+              "July", "August", "September", "October", "November", "December"]
+    monthly_plan = []
+    for m in months:
+        key = m[:3] if m[:3] != "Jun" else "Jun"
+        abbr = m[:3]
+        if abbr in peak:
+            pacing = f"Peak — 100% (${monthly:,})"
+            focus = "Peak-season demand capture"
+        elif abbr in shoulder:
+            pacing = f"Shoulder — 50% (${int(monthly*0.5):,})"
+            focus = "Shoulder-season tune-ups & early replacement"
+        else:
+            pacing = f"Mild — 35% (${int(monthly*0.35):,})"
+            focus = "Maintenance, memberships & brand-building"
+        monthly_plan.append({
+            "month": m, "focus": focus,
+            "message": "Match spend to comfort demand — lean in when weather drives calls, ease off when it's mild.",
+            "triggers": triggers[:2] if abbr in peak else triggers[3:5],
+            "pacing": pacing,
+        })
+
+    geofence = [
+        {"priority": 1, "name": "Newer owner-occupied neighborhoods", "city_state": zip_code,
+         "category": "Home-improver audience", "area_or_market": f"Within {radius} mi",
+         "recommended_method": "audience_targeting", "recommended_radius_miles": radius,
+         "audience_reason": "Higher propensity for system upgrades and replacements.",
+         "best_message": "Beat the next heat wave — upgrade before it fails.", "confidence": "medium"},
+        {"priority": 1, "name": "Recent movers (last 6 months)", "city_state": zip_code,
+         "category": "New-mover data", "area_or_market": f"Within {radius} mi",
+         "recommended_method": "audience_targeting", "recommended_radius_miles": radius,
+         "audience_reason": "New movers are ~5x more likely to buy home services.", "best_message":
+         "New home? Get your comfort system checked.", "confidence": "medium"},
+        {"priority": 2, "name": "Home-improvement retailers", "city_state": zip_code,
+         "category": "Retail geofence", "area_or_market": f"Within {radius} mi",
+         "recommended_method": "geofence", "recommended_radius_miles": 2,
+         "audience_reason": "Homeowners in active-improvement mindset.",
+         "best_message": "Skip the DIY — book a pro tune-up.", "confidence": "medium"},
+        {"priority": 2, "name": "Older housing-stock ZIP clusters", "city_state": zip_code,
+         "category": "Replacement-ready homes", "area_or_market": f"Within {radius} mi",
+         "recommended_method": "zip_targeting", "recommended_radius_miles": radius,
+         "audience_reason": "Aging systems (~10+ yrs) drive replacement demand.",
+         "best_message": "Is your system on borrowed time?", "confidence": "medium"},
+        {"priority": 3, "name": "Competitor HVAC service areas", "city_state": zip_code,
+         "category": "Conquest", "area_or_market": f"Within {radius} mi",
+         "recommended_method": "conquest", "recommended_radius_miles": radius,
+         "audience_reason": "Capture demand shopping your competitors.",
+         "best_message": "Faster response, no-surprise pricing.", "confidence": "low"},
+    ]
+
+    return {
+        "market_summary": f"Baseline Comfort & Command plan for {company} in {zip_code} "
+                          f"(within {radius} miles). Figures below are Smart 1 planning "
+                          "baselines and will be refined with a strategist.",
+        "market_type": "Dual-Season Heating & Cooling Market",
+        "market_type_description": "Demand swings with both summer heat and winter cold, "
+                                   "so budget is paced to weather rather than spread flat.",
+        "market_opportunity": f"Capture emergency search demand and weather-triggered "
+                              f"replacement sales across {company}'s {radius}-mile service area.",
+        "market_profile": {
+            "estimated_population_low": pop[0], "estimated_population_base": pop[1], "estimated_population_high": pop[2],
+            "estimated_households_low": hh[0], "estimated_households_base": hh[1], "estimated_households_high": hh[2],
+            "estimated_homeowner_households_low": own[0], "estimated_homeowner_households_base": own[1], "estimated_homeowner_households_high": own[2],
+            "estimated_replacement_opportunity_low": rep[0], "estimated_replacement_opportunity_base": rep[1], "estimated_replacement_opportunity_high": rep[2],
+            "confidence": "low",
+            "assumptions": ["Baseline estimate scaled from service radius; not census-verified.",
+                            "A strategist will confirm real market figures before activation."],
+        },
+        "recommended_package": {
+            "package_name": name, "monthly_investment": price,
+            "description": "Best-fit starting tier based on your service area, crews, and goals. "
+                           "Media budgets stay transparent and separate from management fees.",
+        },
+        "media_channels": ["Google LSA (Google Guaranteed)", "In-Market HVAC Buyer Audience Data",
+                           "High-intent Search / PPC", "SmartForecast CTV/OTT",
+                           "New-Mover & home-improver display", "Local Business Boost",
+                           "Missed-Call Text Back"],
+        "streaming_audio_note": "Geotarget streaming audio around home neighborhoods and "
+                                "home-improvement retail during morning and evening dayparts, "
+                                "when homeowners most notice comfort issues.",
+        "weather_triggers": triggers,
+        "monthly_plan": monthly_plan,
+        "geofence_locations": geofence,
+        "disclaimer": "Figures are Smart 1 Marketing planning baselines generated without live "
+                      "data, not exact counts. A strategist finalizes market data, budget, and "
+                      "geography before activation.",
+    }
+
+
+# ---------------------------------------------------------------------------
 # PDF report — reportlab, pure Python. Produces a hosted PDF your team can send
 # from Smart 1 Suite. Guarded so any failure never blocks the lead/webhook.
 # ---------------------------------------------------------------------------
 
-NAVY = colors.HexColor("#0d2240")
-TEAL = colors.HexColor("#16bcae")
-BLUE = colors.HexColor("#1f9ed6")
+NAVY = colors.HexColor("#0a2240")
+COOL = colors.HexColor("#0a9ed6")
 HEAT = colors.HexColor("#f2683c")
-LINE = colors.HexColor("#e4e9ef")
-MUTED = colors.HexColor("#6b7c8e")
-CARD = colors.HexColor("#f8fbfd")
-INK = colors.HexColor("#25364b")
-QUOTE = colors.HexColor("#eaf7fb")
-LEADC = colors.HexColor("#33465a")
-PAGE_W, PAGE_H = letter
-
-# Fixed HVAC package menu (name/price must match generate_report + index.html).
-PACKAGE_TIERS = [
-    ("Starter", "$749/mo", "$749/month", "Comfort Starter",
-     "Get found first — Google LSA + high-intent Search foundation."),
-    ("Foundation", "$1,499/mo", "$1,499/month", "Local Comfort Foundation",
-     "Dominate one city — LSA + Search, LBB, Missed-Call Text Back, reviews."),
-    ("★ Recommended", "$3,499/mo", "$3,499/month", "Omnichannel Market Leader",
-     "Adds SmartClimate CTV + New-Mover display for replacement demand."),
-    ("Scale", "$6,500/mo", "$6,500/month", "Regional Domination",
-     "Full weather-triggered omnichannel across multiple markets."),
-]
-
-
-def _trigger_kind(label: str) -> str:
-    l = (label or "").lower()
-    if any(k in l for k in ["heat", "humid", "warm", "90", "85", "sun"]):
-        return "hot"
-    if any(k in l for k in ["freez", "frost", "cold", "snow", "ice", "32"]):
-        return "cold"
-    return "neutral"
-
-
-class ProposalCanvas(_canvas.Canvas):
-    """Draws the navy header band (tall title band on page 1, slim on later
-    pages) plus a footer with a page counter on every page."""
-
-    company = ""
-    title_line = "HVAC Comfort & Command Proposal"
-    subtitle = "Weather-triggered advertising plan prepared for your market"
-    footer = ("Smart 1 Marketing  ·  Weather-triggered plan based on AI "
-              "market estimates. Verify locations and figures before activation.")
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._saved = []
-
-    def showPage(self):
-        self._saved.append(dict(self.__dict__))
-        self._startPage()
-
-    def save(self):
-        total = len(self._saved)
-        for i, state in enumerate(self._saved):
-            self.__dict__.update(state)
-            self._draw_decoration(i + 1, total)
-            super().showPage()
-        super().save()
-
-    def _draw_decoration(self, page, total):
-        w, h = PAGE_W, PAGE_H
-        band = 78 if page == 1 else 54
-        # header band + teal accent
-        self.setFillColor(NAVY)
-        self.rect(0, h - band, w, band, fill=1, stroke=0)
-        self.setFillColor(TEAL)
-        self.rect(0, h - band - 5, w, 5, fill=1, stroke=0)
-        # logo lockup: SMART(1)MARKETING with a teal "1"
-        y = h - 30
-        self.setFont("Helvetica-Bold", 13)
-        x = 40
-        self.setFillColor(colors.white)
-        self.drawString(x, y, "SMART")
-        x += self.stringWidth("SMART", "Helvetica-Bold", 13)
-        self.setFillColor(TEAL)
-        self.drawString(x, y, "1")
-        x += self.stringWidth("1", "Helvetica-Bold", 13)
-        self.setFillColor(colors.white)
-        self.drawString(x, y, "MARKETING")
-        if page == 1:
-            self.setFont("Helvetica-Bold", 17)
-            self.setFillColor(colors.white)
-            self.drawString(40, h - 56, self.title_line)
-            self.setFont("Helvetica", 9)
-            self.setFillColor(colors.HexColor("#b9c6d6"))
-            self.drawString(40, h - 70, self.subtitle)
-        else:
-            self.setFont("Helvetica-Bold", 9)
-            self.setFillColor(colors.HexColor("#c3d0de"))
-            self.drawRightString(w - 40, h - 27, self.company or "")
-        # footer
-        self.setStrokeColor(colors.HexColor("#e0e6ec"))
-        self.setLineWidth(0.5)
-        self.line(40, 42, w - 40, 42)
-        self.setFont("Helvetica", 7)
-        self.setFillColor(colors.HexColor("#9aa7b4"))
-        self.drawString(40, 30, self.footer)
-        self.drawRightString(w - 40, 30, f"{page} / {total}")
+GREEN = colors.HexColor("#2dbb72")
+LINE = colors.HexColor("#dbe5ed")
+MUTED = colors.HexColor("#68798c")
+AQUA = colors.HexColor("#fff2ec")
 
 
 def _money_to_int(value: str):
@@ -457,313 +510,157 @@ def _pdf_styles():
                         fontSize=13, leading=16, textColor=NAVY, spaceBefore=16, spaceAfter=6)
     title = ParagraphStyle("s1title", parent=ss["Title"], fontName="Helvetica-Bold",
                            fontSize=22, leading=25, textColor=NAVY, alignment=TA_LEFT, spaceAfter=4)
-    grey = colors.HexColor("#93a0ad")
-
-    def S(name, **kw):
-        return ParagraphStyle(name, parent=body, **kw)
-
-    return dict(
-        body=body, h2=h2, title=title,
-        by=S("by", fontName="Helvetica", fontSize=8.5, textColor=MUTED, spaceAfter=2),
-        lead=S("lead", fontName="Helvetica", fontSize=9.5, leading=12.5, textColor=LEADC,
-               alignment=TA_JUSTIFY, spaceAfter=4),
-        seclabel=S("sl", fontName="Helvetica-Bold", fontSize=7.5, textColor=grey, leading=10),
-        metaL=S("ml", fontName="Helvetica-Bold", fontSize=6, textColor=grey, leading=8),
-        metaV=S("mv", fontName="Helvetica-Bold", fontSize=9.5, textColor=NAVY, leading=13),
-        badge=S("bd", fontName="Helvetica-Bold", fontSize=9, textColor=colors.white, leading=12),
-        statN=S("sn", fontName="Helvetica-Bold", fontSize=13, textColor=NAVY, alignment=TA_CENTER, leading=16),
-        statL=S("stl", fontName="Helvetica", fontSize=7, textColor=MUTED, alignment=TA_CENTER, leading=9),
-        tcap=S("tc", fontName="Helvetica-Bold", fontSize=6, textColor=grey, alignment=TA_CENTER, leading=8),
-        tcapR=S("tcr", fontName="Helvetica-Bold", fontSize=6, textColor=HEAT, alignment=TA_CENTER, leading=8),
-        tprice=S("tp", fontName="Helvetica-Bold", fontSize=12, textColor=NAVY, alignment=TA_CENTER, leading=15),
-        tname=S("tn", fontName="Helvetica-Bold", fontSize=7.5, textColor=INK, alignment=TA_CENTER, leading=9),
-        tblurb=S("tb", fontName="Helvetica", fontSize=6.2, textColor=MUTED, alignment=TA_CENTER, leading=8),
-        rec=S("rc", fontName="Helvetica", fontSize=9.5, leading=14, textColor=INK),
-        note=S("nt", fontName="Helvetica", fontSize=8.5, leading=13, textColor=colors.HexColor("#2c3e50")),
-        pay=S("py", fontName="Helvetica", fontSize=8.8, leading=13, textColor=INK),
-        darkEye=S("de", fontName="Helvetica-Bold", fontSize=7, textColor=TEAL, leading=10),
-        darkH=S("dh", fontName="Helvetica-Bold", fontSize=12.5, textColor=colors.white, leading=15, spaceAfter=4),
-        darkP=S("dp", fontName="Helvetica", fontSize=8.5, leading=13, textColor=colors.HexColor("#c3d0de")),
-        darkLi=S("dl", fontName="Helvetica", fontSize=8.3, leading=13, textColor=colors.HexColor("#dbe4ee")),
-        tile=S("ti", fontName="Helvetica-Bold", fontSize=9, textColor=colors.white, alignment=TA_CENTER),
-        mc=S("mc", fontName="Helvetica-Bold", fontSize=8.5, textColor=NAVY, leading=11),
-        subH=S("sh", fontName="Helvetica-Bold", fontSize=8.3, textColor=NAVY, leading=11, spaceBefore=6),
-        subP=S("sp", fontName="Helvetica", fontSize=8.3, leading=12, textColor=colors.HexColor("#4a5b6c")),
-        cellw=S("cw", fontName="Helvetica-Bold", fontSize=7.5, textColor=colors.white, leading=10),
-        cell=S("cl", fontName="Helvetica", fontSize=8, leading=10.5, textColor=LEADC),
-        cellb=S("cb", fontName="Helvetica-Bold", fontSize=8, leading=10.5, textColor=NAVY),
-        cellm=S("cm", fontName="Helvetica", fontSize=7, leading=9.5, textColor=MUTED),
-        ctaH=S("ch", fontName="Helvetica-Bold", fontSize=13, textColor=colors.white, leading=16, spaceAfter=3),
-        ctaP=S("cta_p", fontName="Helvetica", fontSize=8.6, leading=13, textColor=colors.HexColor("#c3d0de")),
-        ctaA=S("ca", fontName="Helvetica-Bold", fontSize=9, textColor=TEAL, spaceBefore=6),
-        disc=S("ds", fontName="Helvetica-Oblique", fontSize=7, leading=10, textColor=grey),
-    )
+    eyebrow = ParagraphStyle("s1eye", parent=body, fontName="Helvetica-Bold",
+                             fontSize=8, textColor=HEAT, spaceAfter=2)
+    small = ParagraphStyle("s1small", parent=body, fontSize=8, textColor=MUTED, leading=11)
+    cell = ParagraphStyle("s1cell", parent=body, fontSize=8, leading=10.5)
+    cellw = ParagraphStyle("s1cellw", parent=cell, textColor=colors.white)
+    return dict(body=body, h2=h2, title=title, eyebrow=eyebrow, small=small, cell=cell, cellw=cellw)
 
 
-def build_report_pdf(report: dict, company: str, base_url: str, inputs: dict = None) -> str:
-    """Render the report JSON to a branded multi-page proposal PDF, save under
-    static/reports, and return its absolute public URL (or '' on failure)."""
+def _store_report_pdf(pdf_bytes: bytes, company: str, base_url: str) -> str:
+    """Persist the PDF and return a public URL. Uploads to Cloudinary when
+    configured (permanent); otherwise writes to static/reports (ephemeral on Render)."""
+    slug = _slug(company) or "report"
+    stamp = int(time.time())
+    if CLOUDINARY_READY:
+        try:
+            # Stored as raw so the PDF is served/downloaded as-is (no image-delivery block).
+            public_id = f"{REPORT_ASSET_NAME}/{slug}-{stamp}.pdf"
+            res = cloudinary.uploader.upload(
+                io.BytesIO(pdf_bytes),
+                resource_type="raw",
+                public_id=public_id,
+                overwrite=True,
+                unique_filename=False,
+                use_filename=False,
+            )
+            url = res.get("secure_url", "")
+            if url:
+                return url
+        except Exception:
+            app.logger.exception("Cloudinary upload failed — falling back to local storage")
+    # Local fallback
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    filename = f"{slug}-{stamp}.pdf"
+    with open(os.path.join(REPORT_DIR, filename), "wb") as fh:
+        fh.write(pdf_bytes)
+    base = base_url or PUBLIC_BASE_URL
+    return f"{base.rstrip('/')}/static/reports/{filename}" if base else f"/static/reports/{filename}"
+
+
+def build_report_pdf(report: dict, company: str, base_url: str) -> str:
+    """Render the report JSON to a branded PDF, store it (Cloudinary or local),
+    and return its public URL (or '' on failure)."""
     if not ENABLE_PDF:
         return ""
     try:
-        inputs = inputs or {}
-        os.makedirs(REPORT_DIR, exist_ok=True)
         st = _pdf_styles()
         fmt = lambda n: f"{int(n):,}" if n is not None else "—"
         rng = lambda a, b: f"{fmt(a)}–{fmt(b)}"
         m = report.get("market_profile", {}) or {}
         rp = report.get("recommended_package", {}) or {}
-        CW = PAGE_W - 80  # content width between 40pt margins
 
-        filename = f"{_slug(company)}-{int(time.time())}.pdf"
-        path = os.path.join(REPORT_DIR, filename)
-
-        def seclabel(txt):
-            return [Spacer(1, 5), Paragraph(txt.upper(), st["seclabel"]),
-                    HRFlowable(width="100%", thickness=0.6, color=LINE, spaceBefore=4, spaceAfter=7)]
+        buffer = io.BytesIO()
 
         story = []
-        # ---- PAGE 1 ----
+        story.append(Paragraph("SMART 1 MARKETING &nbsp;|&nbsp; HVAC COMFORT &amp; COMMAND PLAN", st["eyebrow"]))
         story.append(Paragraph(company or "Market Plan", st["title"]))
-        story.append(Paragraph("Prepared by Smart 1 Marketing  ·  " + time.strftime("%B %d, %Y"), st["by"]))
+        story.append(Paragraph(report.get("market_summary", ""), st["body"]))
+        story.append(Spacer(1, 6))
 
-        lsa_map = {"yes_active": "Running now", "paused": "Paused",
-                   "no": "Not yet running", "unsure": "To be confirmed"}
-        market_cell = f"{inputs.get('company_zip', '—')} · {inputs.get('service_radius', '—')}"
-        meta = [
-            ("Market", market_cell),
-            ("Est. Replacement-Ready HH", rng(m.get("estimated_replacement_opportunity_low"), m.get("estimated_replacement_opportunity_high"))),
-            ("Recommended Plan", rp.get("monthly_investment", "—")),
-            ("Media Approach", "Weather-triggered"),
-            ("Budget Pacing", "Peak / Shoulder / Mild"),
-            ("Google LSA Status", lsa_map.get(inputs.get("lsa_status", ""), "To be confirmed")),
-        ]
-        mcell = lambda l, v: [Paragraph(l.upper(), st["metaL"]), Spacer(1, 2), Paragraph(v, st["metaV"])]
-        meta_tbl = Table(
-            [[mcell(*meta[0]), mcell(*meta[1]), mcell(*meta[2])],
-             [mcell(*meta[3]), mcell(*meta[4]), mcell(*meta[5])]],
-            colWidths=[CW / 3] * 3)
-        meta_tbl.setStyle(TableStyle([
-            ("BOX", (0, 0), (-1, -1), 0.8, LINE),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 14), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-            ("TOPPADDING", (0, 0), (-1, -1), 13), ("BOTTOMPADDING", (0, 0), (-1, -1), 13),
-        ]))
-        story.append(Spacer(1, 10))
-        story.append(meta_tbl)
+        if report.get("market_type"):
+            story.append(Paragraph(f"<b>{report.get('market_type')}</b> — {report.get('market_type_description','')}", st["small"]))
 
-        btext = report.get("market_type", "Market")
-        bw = min(CW, len(btext) * 5.7 + 34)
-        badge = Table([[Paragraph(btext, st["badge"])]], colWidths=[bw])
-        badge.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), NAVY),
-            ("LEFTPADDING", (0, 0), (-1, -1), 16), ("RIGHTPADDING", (0, 0), (-1, -1), 16),
-            ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        stat_data = [[
+            Paragraph(f"<b>{rng(m.get('estimated_population_low'), m.get('estimated_population_high'))}</b><br/><font size=7 color='#68798c'>ESTIMATED POPULATION</font>", st["cell"]),
+            Paragraph(f"<b>{rng(m.get('estimated_homeowner_households_low'), m.get('estimated_homeowner_households_high'))}</b><br/><font size=7 color='#68798c'>HOMEOWNER HOUSEHOLDS</font>", st["cell"]),
+            Paragraph(f"<b>{rng(m.get('estimated_replacement_opportunity_low'), m.get('estimated_replacement_opportunity_high'))}</b><br/><font size=7 color='#68798c'>REPLACEMENT-READY HOMES</font>", st["cell"]),
+        ]]
+        stat = Table(stat_data, colWidths=[2.4 * inch] * 3)
+        stat.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), AQUA),
+            ("BOX", (0, 0), (-1, -1), 0.5, LINE),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, LINE),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10),
         ]))
         story.append(Spacer(1, 8))
-        story.append(badge)
-        story.append(Spacer(1, 5))
-        story.append(Paragraph(report.get("market_type_description", ""), st["lead"]))
-        story.append(Paragraph(report.get("market_summary", ""), st["lead"]))
-
-        story.extend(seclabel("Market Estimate"))
-        scell = lambda num, lab: [Paragraph(num, st["statN"]), Spacer(1, 4), Paragraph(lab, st["statL"])]
-        gap, cw3 = 12, (CW - 24) / 3
-        stat = Table([[
-            scell(rng(m.get("estimated_population_low"), m.get("estimated_population_high")), "Estimated population"), "",
-            scell(rng(m.get("estimated_homeowner_households_low"), m.get("estimated_homeowner_households_high")), "Homeowner households"), "",
-            scell(rng(m.get("estimated_replacement_opportunity_low"), m.get("estimated_replacement_opportunity_high")), "Replacement-ready homes"),
-        ]], colWidths=[cw3, gap, cw3, gap, cw3])
-        stat.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 11), ("BOTTOMPADDING", (0, 0), (-1, -1), 11),
-        ] + [c for i in (0, 2, 4) for c in (
-            ("BACKGROUND", (i, 0), (i, 0), CARD), ("BOX", (i, 0), (i, 0), 0.8, LINE))]))
         story.append(stat)
 
-        story.extend(seclabel("Your Market Opportunity"))
-        story.append(Paragraph(report.get("market_opportunity", ""), st["lead"]))
+        story.append(Paragraph("Your Market Opportunity", st["h2"]))
+        story.append(Paragraph(report.get("market_opportunity", ""), st["body"]))
 
-        story.extend(seclabel("Investment Tiers (Foundation / Recommended / Scale)"))
-        rec_i = 2
-        for i, tier in enumerate(PACKAGE_TIERS):
-            if (rp.get("package_name", "").strip().lower() == tier[3].lower()
-                    or rp.get("monthly_investment", "").replace(" ", "") == tier[2].replace(" ", "")):
-                rec_i = i
-        tgap, tcw = 8, (CW - 24) / 4
-
-        def tier_cell(tier, is_rec):
-            return [Paragraph(tier[0], st["tcapR"] if is_rec else st["tcap"]), Spacer(1, 5),
-                    Paragraph(tier[1], st["tprice"]), Spacer(1, 3),
-                    Paragraph(tier[3], st["tname"]), Spacer(1, 6),
-                    Paragraph(tier[4], st["tblurb"])]
-        trow = []
-        for i, tier in enumerate(PACKAGE_TIERS):
-            trow.append(tier_cell(tier, i == rec_i))
-            if i < 3:
-                trow.append("")
-        tiers = Table([trow], colWidths=[tcw, tgap, tcw, tgap, tcw, tgap, tcw])
-        tstyle = [("VALIGN", (0, 0), (-1, -1), "TOP"),
-                  ("TOPPADDING", (0, 0), (-1, -1), 10), ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-                  ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8)]
-        for ci in (0, 2, 4, 6):
-            tstyle.append(("BOX", (ci, 0), (ci, 0), 0.8, LINE))
-        rc = rec_i * 2
-        tstyle.append(("BACKGROUND", (rc, 0), (rc, 0), colors.HexColor("#fff8f4")))
-        tstyle.append(("BOX", (rc, 0), (rc, 0), 1.4, HEAT))
-        tiers.setStyle(TableStyle(tstyle))
-        story.append(tiers)
-
-        story.append(Spacer(1, 10))
-        story.append(Paragraph(f"<b>Recommended: {rp.get('monthly_investment','')} — {rp.get('package_name','')}.</b> {rp.get('description','')}", st["rec"]))
-        mo = _money_to_int(rp.get("monthly_investment", ""))
-        if mo:
-            jobs = max(1, -(-mo // 6000))
-            story.append(Spacer(1, 5))
-            story.append(Paragraph(
-                f'<b>Does this pay for itself?</b> At a $6,000 average completed-job value, about '
-                f'<font color="#f2683c"><b>{jobs} new job{"s" if jobs > 1 else ""} a month</b></font> '
-                f'covers the entire {rp.get("monthly_investment","")} plan — everything after that is added profit.',
-                st["pay"]))
-        nb = Table([[Paragraph("This is a suggested budget based on your market's size. In a quick consult we'll tailor a budget and plan that fits your company's goals, capacity, and cash flow.", st["note"])]], colWidths=[CW])
-        nb.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), QUOTE), ("LINEBEFORE", (0, 0), (0, -1), 3, TEAL),
-            ("LEFTPADDING", (0, 0), (-1, -1), 16), ("RIGHTPADDING", (0, 0), (-1, -1), 14),
-            ("TOPPADDING", (0, 0), (-1, -1), 11), ("BOTTOMPADDING", (0, 0), (-1, -1), 11)]))
-        story.append(Spacer(1, 9))
-        story.append(nb)
-
-        # ---- PAGE 2 ----
-        story.append(PageBreak())
-        story.extend(seclabel("How This Saves You Money"))
-        bullets = [
-            "Pauses spend on mild, low-demand days instead of paying for empty impressions.",
-            "Targets in-market homeowners and new movers instead of broadcasting to the whole metro.",
-            "Rolls unused shoulder-season budget forward instead of losing it to a fixed monthly buy.",
-            "Covers emergency repair, system replacement, and retention from one budget — not three campaigns.",
-        ]
-        dark_flow = [Paragraph("WHY THIS SAVES YOU MONEY", st["darkEye"]),
-                     Paragraph("Spend on the days demand is real, not on a flat calendar.", st["darkH"]),
-                     Paragraph("Traditional radio, print, and always-on digital bill you every week regardless of the forecast. A weather-triggered plan concentrates budget on high-intent days.", st["darkP"]),
-                     Spacer(1, 6)]
-        for b in bullets:
-            dark_flow.append(Paragraph(f'<font color="#16bcae"><b>+</b></font>&nbsp;&nbsp;{b}', st["darkLi"]))
-            dark_flow.append(Spacer(1, 3))
-        dk = Table([[dark_flow]], colWidths=[CW])
-        dk.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), NAVY),
-            ("LEFTPADDING", (0, 0), (-1, -1), 22), ("RIGHTPADDING", (0, 0), (-1, -1), 22),
-            ("TOPPADDING", (0, 0), (-1, -1), 20), ("BOTTOMPADDING", (0, 0), (-1, -1), 16)]))
-        story.append(dk)
+        story.append(Paragraph("Recommended Package", st["h2"]))
+        story.append(Paragraph(f"<b>{rp.get('monthly_investment','')} — {rp.get('package_name','')}</b>", st["body"]))
+        story.append(Paragraph(rp.get("description", ""), st["small"]))
 
         chans = report.get("media_channels", []) or []
         if chans:
-            story.extend(seclabel("Recommended Media Channels"))
-            mgap = 12
-            mcw = (CW - mgap) / 2
-
-            def channel_card(name, idx):
-                letter = next((c for c in name if c.isalnum()), "•").upper()
-                tile = Table([[Paragraph(letter, st["tile"])]], colWidths=[22], rowHeights=[22])
-                tile.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, -1), TEAL if idx % 2 else BLUE),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                    ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
-                card = Table([[tile, Paragraph(name, st["mc"])]], colWidths=[30, mcw - 30 - 24])
-                card.setStyle(TableStyle([
-                    ("BOX", (0, 0), (-1, -1), 0.8, LINE), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 12),
-                    ("TOPPADDING", (0, 0), (-1, -1), 11), ("BOTTOMPADDING", (0, 0), (-1, -1), 11)]))
-                return card
-            cards = [channel_card(c, i) for i, c in enumerate(chans)]
-            mrows = []
-            for i in range(0, len(cards), 2):
-                mrows.append([cards[i], "", cards[i + 1] if i + 1 < len(cards) else ""])
-            mtbl = Table(mrows, colWidths=[mcw, mgap, mcw])
-            mtbl.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
-                                      ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-                                      ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
-            story.append(mtbl)
-
-        if report.get("streaming_audio_note"):
-            story.extend(seclabel("Streaming Audio — Neighborhood Daypart"))
-            story.append(Paragraph(report.get("streaming_audio_note", ""), st["lead"]))
+            story.append(Paragraph("Recommended Media Channels", st["h2"]))
+            story.append(Paragraph(" &nbsp;•&nbsp; ".join(chans), st["body"]))
 
         trigs = report.get("weather_triggers", []) or []
         if trigs:
-            story.extend(seclabel("Recommended Weather Triggers"))
-            toks = []
-            for t in trigs:
-                k = _trigger_kind(t)
-                col = "#b6482a" if k == "hot" else ("#166a8f" if k == "cold" else "#0d2240")
-                toks.append(f'<font color="{col}"><b>{t}</b></font>')
-            story.append(Paragraph("&nbsp;&nbsp;·&nbsp;&nbsp;".join(toks), st["mc"]))
+            story.append(Paragraph("SmartForecast Weather Triggers", st["h2"]))
+            story.append(Paragraph(" &nbsp;•&nbsp; ".join(trigs), st["body"]))
 
-        # ---- PAGE 3 ----
         plan = report.get("monthly_plan", []) or []
         if plan:
-            story.append(PageBreak())
-            story.extend(seclabel("Month-by-Month Campaign Plan"))
-            rows = [[Paragraph("Month", st["cellw"]), Paragraph("Focus &amp; Message", st["cellw"]), Paragraph("Budget Pacing", st["cellw"])]]
+            story.append(Paragraph("Month-by-Month Campaign Plan", st["h2"]))
+            rows = [[Paragraph("<b>Month</b>", st["cellw"]), Paragraph("<b>Focus</b>", st["cellw"]), Paragraph("<b>Budget Pacing</b>", st["cellw"])]]
             for x in plan:
-                fm = [Paragraph(x.get("focus", ""), st["cellb"]), Paragraph(x.get("message", ""), st["cellm"])]
-                rows.append([Paragraph(x.get("month", ""), st["cell"]), fm, Paragraph(x.get("pacing", ""), st["cell"])])
-            t = Table(rows, colWidths=[78, CW - 78 - 150, 150], repeatRows=1)
+                rows.append([
+                    Paragraph(x.get("month", ""), st["cell"]),
+                    Paragraph(x.get("focus", ""), st["cell"]),
+                    Paragraph(x.get("pacing", ""), st["cell"]),
+                ])
+            t = Table(rows, colWidths=[1.1 * inch, 3.3 * inch, 2.8 * inch], repeatRows=1)
             t.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
-                ("LINEBELOW", (0, 0), (-1, -1), 0.5, LINE),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fbfc")]),
+                ("GRID", (0, 0), (-1, -1), 0.5, LINE),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 11), ("RIGHTPADDING", (0, 0), (-1, -1), 11),
-                ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
             story.append(t)
 
-        # ---- PAGE 4 ----
         geo = sorted(report.get("geofence_locations", []) or [], key=lambda g: g.get("priority", 3))
-        story.append(PageBreak())
         if geo:
-            story.extend(seclabel("Sample Targets &amp; Geofences"))
-            rows = [[Paragraph(h, st["cellw"]) for h in ("P", "Location", "Category", "Method", "Radius")]]
+            story.append(Paragraph("Recommended Targets & Geofences", st["h2"]))
+            rows = [[Paragraph(f"<b>{h}</b>", st["cellw"]) for h in ("P", "Location", "Category", "Method", "Radius", "Conf.")]]
             for g in geo:
-                loc = [Paragraph(g.get("name", ""), st["cellb"]), Paragraph(g.get("city_state", ""), st["cellm"])]
                 rows.append([
-                    Paragraph(f"P{g.get('priority','')}", st["cell"]), loc,
+                    Paragraph(f"P{g.get('priority','')}", st["cell"]),
+                    Paragraph(f"<b>{g.get('name','')}</b><br/>{g.get('city_state','')}", st["cell"]),
                     Paragraph(g.get("category", ""), st["cell"]),
                     Paragraph(str(g.get("recommended_method", "")).replace("_", " "), st["cell"]),
                     Paragraph(f"{g.get('recommended_radius_miles','')} mi", st["cell"]),
+                    Paragraph(g.get("confidence", ""), st["cell"]),
                 ])
-            t = Table(rows, colWidths=[36, CW - 36 - 150 - 108 - 58, 150, 108, 58], repeatRows=1)
+            t = Table(rows, colWidths=[0.4 * inch, 2.2 * inch, 1.5 * inch, 1.3 * inch, 0.7 * inch, 0.6 * inch], repeatRows=1)
             t.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
-                ("LINEBELOW", (0, 0), (-1, -1), 0.5, LINE),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fbfc")]),
+                ("GRID", (0, 0), (-1, -1), 0.5, LINE),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-                ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]))
             story.append(t)
 
-        story.extend(seclabel("Talk to a Strategist"))
-        book = BOOKING_URL or "https://smart1marketing.com"
-        cta_flow = [Paragraph("Ready to turn this into a live campaign?", st["ctaH"]),
-                    Paragraph("A Smart 1 strategist will verify these locations, build your audiences, and tailor a budget that fits your company — free, no obligation.", st["ctaP"]),
-                    Paragraph(f"Book a consult:&nbsp; {book}", st["ctaA"])]
-        cta = Table([[cta_flow]], colWidths=[CW])
-        cta.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), NAVY),
-            ("LEFTPADDING", (0, 0), (-1, -1), 24), ("RIGHTPADDING", (0, 0), (-1, -1), 24),
-            ("TOPPADDING", (0, 0), (-1, -1), 22), ("BOTTOMPADDING", (0, 0), (-1, -1), 22)]))
-        story.append(cta)
-        story.append(Spacer(1, 14))
-        story.append(Paragraph(report.get("disclaimer", ""), st["disc"]))
+        story.append(Spacer(1, 12))
+        story.append(Paragraph(report.get("disclaimer", ""), st["small"]))
 
-        ProposalCanvas.company = company or ""
-        doc = SimpleDocTemplate(path, pagesize=letter, title=f"{company} HVAC Comfort & Command Proposal",
-                                leftMargin=40, rightMargin=40, topMargin=86, bottomMargin=48)
-        doc.build(story, canvasmaker=ProposalCanvas)
+        doc = SimpleDocTemplate(buffer, pagesize=letter, title=f"{company} HVAC Market Plan",
+                                leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+                                topMargin=0.6 * inch, bottomMargin=0.6 * inch)
+        doc.build(story)
 
-        base = base_url or PUBLIC_BASE_URL
-        return f"{base.rstrip('/')}/static/reports/{filename}" if base else f"/static/reports/{filename}"
+        return _store_report_pdf(buffer.getvalue(), company, base_url)
     except Exception:
         app.logger.exception("PDF generation failed")
         return ""
@@ -803,81 +700,19 @@ def send_webhook(payload: dict, report: Any, status: str, pdf_url: str = "") -> 
         app.logger.exception("Webhook delivery failed")
 
 
-# Value one-pager served to already-on-LSA (conquest) leads so the disqualify
-# screen delivers something useful now, not just a "you're on the list" message.
-BEYOND_LSA_HTML = """<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-<title>3 Ways to Grow Beyond Google LSA | Smart 1 Marketing</title>
-<link href=\"https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800&display=swap\" rel=\"stylesheet\">
-<style>:root{--navy:#0a2240;--cool:#0a9ed6;--heat:#f2683c;--ink:#25364b;--muted:#68798c;--line:#dbe5ed}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#fdeee6 0,rgba(253,238,230,0) 380px),radial-gradient(circle at 85% 0,#dff2fb 0,rgba(223,242,251,0) 420px),#f3f7fa;font-family:Montserrat,Arial,sans-serif;color:var(--ink);line-height:1.6}
-.wrap{max-width:820px;margin:0 auto;padding:48px 22px 80px}
-.lock{display:inline-flex;align-items:center;gap:9px;font-size:.72rem;font-weight:800;letter-spacing:.14em;color:var(--navy);margin-bottom:20px}
-.mark{display:grid;place-items:center;width:32px;height:32px;border-radius:9px;background:var(--navy);color:#fff}
-.eyebrow{font-weight:800;letter-spacing:.14em;color:var(--heat);font-size:.72rem}
-h1{color:var(--navy);font-size:2.3rem;letter-spacing:-.03em;margin:.4rem 0 .6rem}
-.sub{color:var(--muted);font-size:1.02rem;max-width:640px}
-.card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:24px 26px;margin:18px 0;box-shadow:0 14px 40px rgba(10,34,64,.07)}
-.card h2{color:var(--navy);font-size:1.2rem;margin:0 0 6px;display:flex;gap:12px;align-items:center}
-.num{flex:0 0 auto;display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--heat);color:#fff;font-weight:800}
-.card p{margin:8px 0 0;color:#3a4b5e}
-.card .why{margin-top:10px;font-size:.86rem;color:var(--muted);border-left:3px solid var(--cool);padding-left:12px}
-.cta{background:var(--navy);border-radius:16px;padding:26px;text-align:center;color:#fff;margin-top:26px}
-.cta h3{margin:0 0 6px;font-size:1.3rem}.cta p{margin:0 0 16px;color:#c7d5e2}
-.cta a{display:inline-block;background:var(--heat);color:#fff;text-decoration:none;font-weight:800;padding:14px 26px;border-radius:10px}
-.foot{color:var(--muted);font-size:.75rem;margin-top:26px;border-top:1px solid var(--line);padding-top:16px}
-@media print{body{background:#fff}.cta{background:#0a2240 !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-</style></head><body><div class=\"wrap\">
-<div class=\"lock\"><span class=\"mark\">S1</span><span>SMART 1 MARKETING</span></div>
-<div class=\"eyebrow\">HVAC GROWTH BRIEF</div>
-<h1>3 Ways to Grow Beyond Google LSA</h1>
-<p class=\"sub\">You already own the highest-intent spot in search. Here's where the next wave of HVAC demand actually comes from — the homeowners LSA never shows you.</p>
-<div class=\"card\"><h2><span class=\"num\">1</span> Catch demand before they search</h2>
-<p>LSA only reaches people already typing \"AC repair near me.\" But most replacement decisions start days earlier, when a system struggles on the first 90&deg; day. SmartClimate&trade; Connected TV and display fire automatically on extreme-weather days and put you in the living room before the emergency search ever happens.</p>
-<div class=\"why\">Weather-triggered media pauses in mild weather, so you only pay on high-value days.</div></div>
-<div class=\"card\"><h2><span class=\"num\">2</span> Own the new-mover window</h2>
-<p>Households that moved in the last 6 months are ~5x more likely to buy home services — and they have no HVAC company yet. New-mover and home-improver audience data lets you be first in the door before a competitor's LSA ever gets the call.</p>
-<div class=\"why\">This is net-new pipeline LSA structurally cannot reach.</div></div>
-<div class=\"card\"><h2><span class=\"num\">3</span> Turn one-time calls into recurring revenue</h2>
-<p>Automated review generation after every ticket lifts your Google rating (lowering future acquisition cost), while Missed-Call Text Back and seasonal tune-up automation convert one-off repairs into maintenance-plan members who buy the eventual replacement from you.</p>
-<div class=\"why\">Lower cost per lead + higher lifetime value on the customers you already win.</div></div>
-<div class=\"cta\"><h3>Want this mapped to your market?</h3>
-<p>We'll build a conquest plan around your service area — free, no obligation.</p>
-<a href=\"__BOOKING_URL__\">Book my conquest strategy call</a></div>
-<p class=\"foot\">Smart 1 Marketing &middot; Media budgets are transparent and separate from software and management fees. Estimates are planning recommendations finalized with a strategist before activation.</p>
-</div></body></html>"""
-
-
 @app.get("/")
+def landing():
+    return render_template("landing.html")
+
+
+@app.get("/plan")
 def index():
-    return render_template("index.html", booking_url=BOOKING_URL)
+    return render_template("index.html")
 
 
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
-
-
-@app.post("/api/capture")
-def capture():
-    """Capture-on-submit: fire a lead webhook the INSTANT the form is submitted,
-    before the AI report runs, so a slow or failed report never loses the lead."""
-    try:
-        payload = clean_payload(request.get_json(silent=True) or {})
-        payload["lead_type"] = payload.get("lead_type") or "qualified"
-        send_webhook(payload, None, "lead_received")
-        return jsonify({"ok": True})
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception:
-        app.logger.exception("Capture failed")
-        return jsonify({"ok": False}), 500
-
-
-@app.get("/beyond-lsa")
-def beyond_lsa():
-    """Value one-pager shown to already-on-LSA (conquest) leads."""
-    return BEYOND_LSA_HTML.replace("__BOOKING_URL__", BOOKING_URL or "#")
 
 
 @app.post("/api/lead")
@@ -905,31 +740,36 @@ def lead():
 
 @app.post("/api/analyze")
 def analyze():
+    # Only a genuinely invalid submission (bad ZIP) is rejected. Everything else
+    # always returns a plan — if the AI call fails, we serve a baseline plan so
+    # the visitor never hits a dead-end error.
     try:
         payload = clean_payload(request.get_json(silent=True) or {})
-        report = generate_report(payload)
-        base_url = PUBLIC_BASE_URL or request.url_root
-        pdf_url = build_report_pdf(report, payload.get("company_name", "Market Plan"), base_url, payload)
-        send_webhook(payload, report, "completed", pdf_url)
-        return jsonify({"ok": True, "report": report, "report_pdf_url": pdf_url})
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception as exc:
-        app.logger.exception("Analysis failed")
-        try:
-            send_webhook(clean_payload(request.get_json(silent=True) or {}), None, "failed")
-        except Exception:
-            pass
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "error": "The plan could not be generated. Check the server configuration and try again.",
-                    "detail": f"{type(exc).__name__}: {exc}",
-                }
-            ),
-            500,
-        )
+
+    status = "completed"
+    try:
+        report = generate_report(payload)
+    except Exception:
+        app.logger.exception("AI generation failed — serving baseline plan")
+        report = fallback_report(payload)
+        report["_generated_by"] = "baseline"
+        status = "completed_baseline"
+
+    base_url = PUBLIC_BASE_URL or request.url_root
+    try:
+        pdf_url = build_report_pdf(report, payload.get("company_name", "Market Plan"), base_url)
+    except Exception:
+        app.logger.exception("PDF build failed — continuing without PDF")
+        pdf_url = ""
+
+    try:
+        send_webhook(payload, report, status, pdf_url)
+    except Exception:
+        app.logger.exception("Webhook delivery failed")
+
+    return jsonify({"ok": True, "report": report, "report_pdf_url": pdf_url})
 
 
 if __name__ == "__main__":
