@@ -6,6 +6,8 @@ import time
 from typing import Any
 
 import requests
+
+import lead_store
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 
@@ -666,9 +668,14 @@ def build_report_pdf(report: dict, company: str, base_url: str) -> str:
         return ""
 
 
-def send_webhook(payload: dict, report: Any, status: str, pdf_url: str = "") -> None:
-    if not WEBHOOK_URL:
-        return
+def send_webhook(payload: dict, report: Any, status: str, pdf_url: str = "") -> dict:
+    """Write the lead down, then try to deliver it. Returns what happened.
+
+    Three silent losses closed here: an unset WEBHOOK_URL returning before the
+    body was even built, a caught timeout leaving nothing behind, and a POST
+    whose status was never read -- so a webhook URL with a typo answered 404 and
+    the lead read as delivered.
+    """
     report = report or {}
     mp = report.get("market_profile", {}) or {}
     rp = report.get("recommended_package", {}) or {}
@@ -694,10 +701,27 @@ def send_webhook(payload: dict, report: Any, status: str, pdf_url: str = "") -> 
         "report_pdf_url": pdf_url,
         "report_json": json.dumps(report, separators=(",", ":"))[:60000],
     }
+    # The report is left out of the record: large, regenerable, already on
+    # Cloudinary, and the one field that would push a log line past the size
+    # that keeps an append from tearing.
+    row = lead_store.record({k: v for k, v in body.items() if k != "report_json"},
+                            kind=status)
+    if not WEBHOOK_URL:
+        lead_store.mark(row, "failed: neither GHL_WEBHOOK_URL nor SMART1_WEBHOOK_URL is set")
+        return {"recorded": True, "delivered": False, "lead_id": row.get("lead_id")}
     try:
-        requests.post(WEBHOOK_URL, json=body, timeout=12)
-    except requests.RequestException:
+        resp = requests.post(WEBHOOK_URL, json=body, timeout=12)
+    except requests.RequestException as exc:
         app.logger.exception("Webhook delivery failed")
+        lead_store.mark(row, f"failed: {exc.__class__.__name__}")
+        return {"recorded": True, "delivered": False, "lead_id": row.get("lead_id")}
+    if resp.status_code >= 400:
+        app.logger.error("Webhook rejected the lead: HTTP %s %s",
+                         resp.status_code, (resp.text or "")[:300])
+        lead_store.mark(row, f"failed: HTTP {resp.status_code}")
+        return {"recorded": True, "delivered": False, "lead_id": row.get("lead_id")}
+    lead_store.mark(row, "sent", http_status=resp.status_code)
+    return {"recorded": True, "delivered": True, "lead_id": row.get("lead_id")}
 
 
 @app.get("/")
@@ -712,7 +736,18 @@ def index():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    """Whether this app can do its job, not merely whether it booted."""
+    return jsonify({
+        "status": "ok" if WEBHOOK_URL else "degraded",
+        "lead_delivery": {
+            "webhook_configured": bool(WEBHOOK_URL),
+            "log": lead_store.leads_path(),
+            "owed": len(lead_store.unsent()),
+        },
+        "detail": ("" if WEBHOOK_URL else
+                   "No GHL_WEBHOOK_URL or SMART1_WEBHOOK_URL is set. Leads are being "
+                   "recorded and can be replayed with replay_failed.py once one is."),
+    })
 
 
 @app.post("/api/lead")
@@ -731,8 +766,13 @@ def lead():
             "lead_type": "conquest_disqualified",
             "notes": "Already running Google LSA — routed to conquest list.",
         }
-        send_webhook(payload, None, "conquest_captured")
-        return jsonify({"ok": True})
+        delivery = send_webhook(payload, None, "conquest_captured")
+        # Nothing is generated on this branch, so `ok` really is about the lead.
+        # It is still recorded and replayable either way, which is what the
+        # response says rather than implying the CRM has it.
+        return jsonify({"ok": True,
+                        "lead_recorded": delivery.get("recorded", False),
+                        "lead_delivered": delivery.get("delivered", False)})
     except Exception:
         app.logger.exception("Lead capture failed")
         return jsonify({"ok": False, "error": "Could not capture the lead."}), 500
