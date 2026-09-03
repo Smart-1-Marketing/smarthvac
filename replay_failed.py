@@ -104,7 +104,25 @@ def main() -> int:
         rows = [r for r in rows if r.get("lead_id") == args.lead_id]
 
     if not rows:
-        print("Nothing owed.")
+        if args.from_cloudinary:
+            print("Nothing owed: the durable copy holds no unsent leads.")
+            return 0
+        # An empty local log is NOT evidence that nothing is owed. This service
+        # has no Render disk, so leads.jsonl lives inside the container and dies
+        # with it -- on every deploy, and on every free-tier idle spin-down,
+        # which lands about fifteen minutes after the last request. Printing a
+        # flat "nothing owed" off that would be the confident all-clear this
+        # whole tool exists to prevent, handed over at the one moment somebody
+        # is actually looking for lost leads.
+        print("Nothing owed *in the local log* -- which is not the same answer.")
+        if (os.getenv("CLOUDINARY_URL", "") or "").strip():
+            print("\nThat log lives in the container and is destroyed on every restart\n"
+                  "and every idle spin-down, so it is routinely empty. Ask the durable\n"
+                  "copy before concluding anything:\n\n"
+                  "    python3 replay_failed.py --from-cloudinary --dry-run\n")
+        else:
+            print("\nAnd CLOUDINARY_URL is not set, so there is no durable copy to check\n"
+                  "either -- any lead recorded before the last restart is unrecoverable.\n")
         return 0
 
     for r in rows:
