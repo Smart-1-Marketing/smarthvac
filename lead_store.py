@@ -57,6 +57,18 @@ SOURCE_SLUG = "hvac"
 MAX_VALUE = 1500
 
 _STATUS_SENT = "sent"
+# The Hub answers three ways, and only one of them means this app still owes
+# the lead to anybody. "accepted" is the Hub having stored it and taken over
+# the retry itself: replaying one of those from here writes a second lead row
+# for a single visitor, which is the duplicate the single write path exists to
+# prevent. So it is done as far as this app is concerned, and still not a
+# contact -- which is why the two are counted apart rather than merged.
+_STATUS_ACCEPTED = "accepted"
+# A lead with nobody to contact on it -- an abandoned form that never reached
+# the contact step. Not owed, because no number of retries will make one
+# deliverable; kept and counted, because it is still a real visitor.
+_STATUS_UNDELIVERABLE = "undeliverable"
+_DONE_STATUSES = (_STATUS_SENT, _STATUS_ACCEPTED, _STATUS_UNDELIVERABLE)
 
 
 def _data_dir() -> str:
@@ -162,7 +174,17 @@ def mark(row: dict, status: str, **extra) -> dict:
     row.update({k: v for k, v in extra.items() if v not in (None, "")})
     _append(row)
     _mirror(row)
-    if status != _STATUS_SENT:
+    if str(status).startswith(_STATUS_UNDELIVERABLE):
+        log.info("Lead has nobody to contact, so no contact was created (%s) "
+                 "id=%s", SOURCE_SLUG, row.get("lead_id"))
+    elif status == _STATUS_ACCEPTED:
+        # Not an error: the lead is stored at the Hub and being retried there.
+        # Said out loud anyway, because "stored somewhere else" and "in the
+        # CRM" are different answers and only the second is finished.
+        log.warning("Lead accepted by the Hub, not yet in Smart 1 Suite (%s) "
+                    "id=%s detail=%s", SOURCE_SLUG, row.get("lead_id"),
+                    row.get("detail", ""))
+    elif status != _STATUS_SENT:
         log.error("LEAD NOT DELIVERED (%s) id=%s status=%s fields=%s",
                   SOURCE_SLUG, row.get("lead_id"), status,
                   json.dumps(row.get("fields") or {}, default=str))
@@ -202,5 +224,23 @@ def rows() -> list:
 
 
 def unsent() -> list:
-    """Leads still owed to the CRM -- what `replay_failed.py` re-posts."""
-    return [r for r in rows() if r.get("status") != _STATUS_SENT]
+    """Leads still owed by this app -- what `replay_failed.py` re-posts.
+
+    A lead the Hub accepted is not in here: the Hub holds it and retries it,
+    and re-posting one would create a second lead row for one visitor.
+    `accepted()` is how many are in that state, counted apart because it is
+    not the same claim as being in the CRM.
+    """
+    return [r for r in rows()
+            if not str(r.get("status", "")).startswith(_DONE_STATUSES)]
+
+
+def undeliverable() -> list:
+    """Leads with nobody to contact on them. Kept, never replayed."""
+    return [r for r in rows()
+            if str(r.get("status", "")).startswith(_STATUS_UNDELIVERABLE)]
+
+
+def accepted() -> list:
+    """Leads the Hub has, that are not confirmed in Smart 1 Suite yet."""
+    return [r for r in rows() if r.get("status") == _STATUS_ACCEPTED]

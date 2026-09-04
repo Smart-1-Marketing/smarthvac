@@ -31,10 +31,10 @@ import requests
 from dotenv import load_dotenv
 
 import lead_store
+import suite_lead
 
 load_dotenv()
 
-WEBHOOK_URL = (os.getenv("GHL_WEBHOOK_URL", "") or os.getenv("SMART1_WEBHOOK_URL", "")).strip()
 
 
 def from_cloudinary() -> list:
@@ -134,37 +134,60 @@ def main() -> int:
         print("\n--dry-run: nothing was posted.")
         return 0
 
-    if not WEBHOOK_URL:
+    if not suite_lead.configured():
         # Refused rather than reported as a clean run: replaying into nowhere
         # would mark every one of these "sent" and lose them a second time.
-        print("\nRefusing to replay: neither GHL_WEBHOOK_URL nor SMART1_WEBHOOK_URL is set.",
-              file=sys.stderr)
+        print("\nRefusing to replay: " + suite_lead.why_not(), file=sys.stderr)
         return 2
 
-    sent = failed = 0
+
+    sent = accepted = undeliverable = failed = 0
     for r in rows:
         body = dict(r.get("fields") or {})
         if not body:
             print(f"  {r.get('lead_id')}: no fields recorded, skipping")
             failed += 1
             continue
-        body["replayed"] = "true"       # so the CRM side can tell a replay apart
-        try:
-            resp = requests.post(WEBHOOK_URL, json=body, timeout=15)
-        except requests.RequestException as exc:
-            print(f"  {r.get('lead_id')}: {exc.__class__.__name__}")
-            lead_store.mark(r, f"failed: {exc.__class__.__name__}")
-            failed += 1
+        body["replayed"] = "true"       # so Suite can tell a replay apart
+        res = suite_lead.deliver(
+            source=lead_store.SOURCE_SLUG,
+            page=str(r.get("page") or body.get("page") or "replay"),
+            fields=suite_lead.lead_fields(body),
+            pdf_url=str(body.get("report_pdf_url") or body.get("pdf_url") or ""),
+            meta=suite_lead.lead_meta(
+                body, extra_tags=["replayed", f"report:{r.get('kind') or 'lead'}"]),
+        )
+        if res["status"] == suite_lead.STATUS_DELIVERED:
+            lead_store.mark(r, "sent", contact_id=res["contact_id"],
+                            hub_lead_id=res["hub_lead_id"],
+                            http_status=res["http_status"], replayed=True)
+            print(f"  {r.get('lead_id')}: delivered, contact {res['contact_id']}")
+            sent += 1
             continue
-        if resp.status_code >= 400:
-            print(f"  {r.get('lead_id')}: HTTP {resp.status_code}")
-            lead_store.mark(r, f"failed: HTTP {resp.status_code}")
-            failed += 1
+        if res["status"] == suite_lead.STATUS_ACCEPTED:
+            # The Hub has it and is retrying it there. Counted as done here --
+            # re-posting it on the next run would write a second lead row for
+            # one visitor, which is the duplicate a single path exists to stop.
+            lead_store.mark(r, "accepted", hub_lead_id=res["hub_lead_id"],
+                            http_status=res["http_status"], replayed=True,
+                            detail=res["detail"])
+            print(f"  {r.get('lead_id')}: accepted by the Hub, delivery pending there")
+            accepted += 1
             continue
-        lead_store.mark(r, "sent", http_status=resp.status_code, replayed=True)
-        sent += 1
+        if res["status"] == suite_lead.STATUS_UNDELIVERABLE:
+            # Recorded and not counted as owed: offering it again would be
+            # refused identically, for ever.
+            lead_store.mark(r, f"undeliverable: {res['detail'][:200]}")
+            print(f"  {r.get('lead_id')}: undeliverable -- {res['detail']}")
+            undeliverable += 1
+            continue
+        print(f"  {r.get('lead_id')}: {res['detail']}")
+        lead_store.mark(r, f"failed: {res['detail'][:200]}",
+                        http_status=res["http_status"])
+        failed += 1
 
-    print(f"\nSent {sent}, still owed {failed}.")
+    print(f"\nDelivered {sent}, accepted by the Hub {accepted}, "
+          f"undeliverable {undeliverable}, still owed {failed}.")
     return 0 if failed == 0 else 1
 
 
