@@ -9,6 +9,8 @@ itself one of the things asserted -- an app with no Cloudinary must still keep
 its local record rather than losing the lead twice over.
 """
 import json
+import pathlib
+import importlib
 import os
 import shutil
 import sys
@@ -84,6 +86,55 @@ def main():
     check("capped at MAX_VALUE",
           len(big["fields"]["note"]) == lead_store.MAX_VALUE,
           len(big["fields"]["note"]))
+
+    print("\nthe three answers the Hub gives are three states, not two")
+    os.environ.pop("LEADS_FILE", None)
+    os.environ["LEADS_DIR"] = tmp3 = tempfile.mkdtemp(prefix="leadstore-hub-")
+    importlib.reload(lead_store)
+
+    delivered = lead_store.mark(lead_store.record({"email": "a@example.com"}),
+                                "sent", contact_id="ghl_1")
+    at_hub = lead_store.mark(lead_store.record({"email": "b@example.com"}),
+                             "accepted", hub_lead_id="hub_1")
+    nobody = lead_store.mark(lead_store.record({"website": "https://x.example"}),
+                             "undeliverable: nothing to contact them on")
+    owed = lead_store.mark(lead_store.record({"email": "d@example.com"}),
+                           "failed: Couldn't reach the Hub")
+
+    unsent_ids = {r["lead_id"] for r in lead_store.unsent()}
+    check("a delivered lead is not owed", delivered["lead_id"] not in unsent_ids)
+    # The Hub holds it and is retrying it there. Re-posting it from here would
+    # write a second lead row for one visitor, which is the duplicate a single
+    # write path exists to prevent.
+    check("a lead the Hub accepted is not owed either",
+          at_hub["lead_id"] not in unsent_ids)
+    # An abandoned form that never reached the contact step. Left as a failure
+    # it would sit in the owed count for ever and be replayed on every run --
+    # a backlog that can never clear.
+    check("a lead with nobody to contact is not owed",
+          nobody["lead_id"] not in unsent_ids)
+    check("a real failure still is", owed["lead_id"] in unsent_ids)
+    check("owed counts exactly the one that is", len(unsent_ids) == 1, unsent_ids)
+
+    # Counted apart rather than merged: "stored at the Hub" and "in the CRM"
+    # are different claims, and so is "there was nobody to write down".
+    check("the Hub's copies are counted on their own",
+          [r["lead_id"] for r in lead_store.accepted()] == [at_hub["lead_id"]])
+    check("the contactless ones are counted on their own",
+          [r["lead_id"] for r in lead_store.undeliverable()] == [nobody["lead_id"]])
+    check("a delivered lead keeps the contact id that proves it",
+          delivered.get("contact_id") == "ghl_1", delivered.get("contact_id"))
+
+    shutil.rmtree(tmp3, ignore_errors=True)
+
+    print("\nnothing is delivered to a webhook any more")
+    src = pathlib.Path("app.py").read_text() + pathlib.Path("replay_failed.py").read_text()
+    # The constant is still read on /health, to say a leftover value should be
+    # cleared -- what must not come back is a POST to it.
+    check("no module posts to a webhook URL",
+          "requests.post(WEBHOOK_URL" not in src and "post(WEBHOOK_URL" not in src)
+    check("delivery goes through the one Hub path",
+          "suite_lead.deliver(" in src)
 
     shutil.rmtree(tmp, ignore_errors=True)
     print()
